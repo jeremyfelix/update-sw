@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+
+import json
+import subprocess
+import sys
+
+from tabulate import tabulate
+
+# Runs the following commands:
+#   brew update
+#   brew outdated
+#   brew upgrade
+#   brew cleanup
+#   brew cask outdated
+#   brew cask upgrade
+#   brew cask cleanup
+#   pip3 list -o
+#   pip3 install -U
+
+
+def main():
+    print('Updating brew...')
+    subprocess.call(('brew', 'update'))
+
+    print('\nbrew outdated:')
+    subprocess.call(('brew', 'outdated'))
+
+    reply = input('\nRun brew update? [Y/n]: ')
+    if reply not in ('N', 'n'):
+        subprocess.call(('brew', 'upgrade'))
+
+    print('\nRunning brew cleanup...')
+    subprocess.call(('brew', 'cleanup'))
+
+    print('\nbrew cask outdated:')
+    subprocess.call(('brew', 'cask', 'outdated'))
+
+    reply = input('\nRun brew cask update? [Y/n]: ')
+    if reply not in ('N', 'n'):
+        subprocess.call(('brew', 'cask', 'upgrade'))
+
+    print('\nRunning brew cask cleanup...')
+    subprocess.call(('brew', 'cask', 'cleanup'))
+
+    print('\npip3 list -o:')
+    outdated = json.loads(
+        subprocess.run(('pip3', 'list', '-o', '--format', 'json'),
+                       stdout=subprocess.PIPE).stdout)
+    to_update = []
+    for package in outdated:
+        name = package['name']
+        if name in ('inventory', 'utils', 'pycodestyle'):
+            print('Skipping {name}'.format_map(package))
+        else:
+            to_update.append(
+                (name, package['version'], package['latest_version']))
+
+    if to_update:
+        print(tabulate([('Package', 'Version', 'Latest')] + to_update,
+                       headers='firstrow'))
+        to_update = [row[0] for row in to_update]
+        reply = input('\nRun pip3 install -U {}? [Y/n]: '.format(
+            ', '.join(to_update)))
+        if reply not in ('N', 'n'):
+            subprocess.call(['pip3', 'install', '-U'] + to_update)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)
