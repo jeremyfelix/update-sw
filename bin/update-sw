@@ -49,7 +49,7 @@ def main():
     to_update = []
     for package in outdated:
         name = package['name']
-        if name in ('inventory', 'utils', 'pycodestyle'):
+        if name in ('inventory', 'utils', 'pycodestyle', 'pyflakes'):
             print('Skipping {name}'.format_map(package))
         else:
             to_update.append(
