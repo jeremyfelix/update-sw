@@ -25,7 +25,7 @@ def main():
     print('\nbrew outdated:')
     subprocess.call(('brew', 'outdated'))
 
-    reply = input('\nRun brew update? [Y/n]: ')
+    reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
         subprocess.call(('brew', 'upgrade'))
 
@@ -35,7 +35,7 @@ def main():
     print('\nbrew cask outdated:')
     subprocess.call(('brew', 'cask', 'outdated'))
 
-    reply = input('\nRun brew cask update? [Y/n]: ')
+    reply = input('\nRun brew cask upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
         subprocess.call(('brew', 'cask', 'upgrade'))
 
