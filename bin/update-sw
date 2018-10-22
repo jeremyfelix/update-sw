@@ -18,6 +18,9 @@ from tabulate import tabulate
 #   pip3 install -U
 
 
+PIP_SKIP = ('inventory', 'utils', 'pycodestyle', 'pyflakes')
+
+
 def main():
     print('Updating brew...')
     subprocess.call(('brew', 'update'))
@@ -29,9 +32,6 @@ def main():
     if reply not in ('N', 'n'):
         subprocess.call(('brew', 'upgrade'))
 
-    print('\nRunning brew cleanup...')
-    subprocess.call(('brew', 'cleanup'))
-
     print('\nbrew cask outdated:')
     subprocess.call(('brew', 'cask', 'outdated'))
 
@@ -39,8 +39,8 @@ def main():
     if reply not in ('N', 'n'):
         subprocess.call(('brew', 'cask', 'upgrade'))
 
-    print('\nRunning brew cask cleanup...')
-    subprocess.call(('brew', 'cask', 'cleanup'))
+    print('\nRunning brew cleanup...')
+    subprocess.call(('brew', 'cleanup'))
 
     print('\npip3 list -o:')
     outdated = json.loads(
@@ -49,7 +49,7 @@ def main():
     to_update = []
     for package in outdated:
         name = package['name']
-        if name in ('inventory', 'utils', 'pycodestyle', 'pyflakes'):
+        if name in PIP_SKIP:
             print('Skipping {name}'.format_map(package))
         else:
             to_update.append(
