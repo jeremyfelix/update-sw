@@ -9,7 +9,7 @@ from tabulate import tabulate
 # Runs the following commands:
 #   brew update
 #   brew outdated
-#   brew upgrade
+#   brew upgrade --build-from-source
 #   brew cleanup
 #   brew cask outdated
 #   brew cask upgrade
@@ -30,7 +30,7 @@ def main():
 
     reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.call(('brew', 'upgrade'))
+        subprocess.call(('brew', 'upgrade', '--build-from-source'))
 
     print('\nbrew cask outdated:')
     subprocess.call(('brew', 'cask', 'outdated'))
