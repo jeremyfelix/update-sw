@@ -23,24 +23,24 @@ PIP_SKIP = ('inventory', 'utils', 'pycodestyle', 'pyflakes')
 
 def main():
     print('Updating brew...')
-    subprocess.call(('brew', 'update'))
+    subprocess.run(('brew', 'update'))
 
     print('\nbrew outdated:')
-    subprocess.call(('brew', 'outdated'))
+    subprocess.run(('brew', 'outdated'))
 
     reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.call(('brew', 'upgrade', '--build-from-source'))
+        subprocess.run(('brew', 'upgrade', '--build-from-source'))
 
     print('\nbrew cask outdated:')
-    subprocess.call(('brew', 'cask', 'outdated'))
+    subprocess.run(('brew', 'cask', 'outdated'))
 
     reply = input('\nRun brew cask upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.call(('brew', 'cask', 'upgrade'))
+        subprocess.run(('brew', 'cask', 'upgrade'))
 
     print('\nRunning brew cleanup...')
-    subprocess.call(('brew', 'cleanup'))
+    subprocess.run(('brew', 'cleanup'))
 
     print('\npip3 list -o:')
     outdated = json.loads(
@@ -62,7 +62,7 @@ def main():
         reply = input('\nRun pip3 install -U {}? [Y/n]: '.format(
             ', '.join(to_update)))
         if reply not in ('N', 'n'):
-            subprocess.call(['pip3', 'install', '-U'] + to_update)
+            subprocess.run(['pip3', 'install', '-U'] + to_update)
 
 
 if __name__ == '__main__':
