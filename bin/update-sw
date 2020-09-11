@@ -10,10 +10,9 @@ from tabulate import tabulate
 #   brew update
 #   brew outdated
 #   brew upgrade --build-from-source
+#   brew outdated --cask
+#   brew upgrade --cask
 #   brew cleanup
-#   brew cask outdated
-#   brew cask upgrade
-#   brew cask cleanup
 #   pip3 list -o
 #   pip3 install -U
 
@@ -23,29 +22,29 @@ PIP_SKIP = ('inventory', 'utils', 'pycodestyle', 'pyflakes')
 
 def main():
     print('Updating brew...')
-    subprocess.run(('brew', 'update'))
+    subprocess.run(('brew', 'update'), check=True)
 
     print('\nbrew outdated:')
-    subprocess.run(('brew', 'outdated'))
+    subprocess.run(('brew', 'outdated'), check=True)
 
     reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.run(('brew', 'upgrade', '--build-from-source'))
+        subprocess.run(('brew', 'upgrade', '--build-from-source'), check=True)
 
-    print('\nbrew cask outdated:')
-    subprocess.run(('brew', 'cask', 'outdated'))
+    print('\nbrew outdated --cask:')
+    subprocess.run(('brew', 'outdated', '--cask'), check=True)
 
-    reply = input('\nRun brew cask upgrade? [Y/n]: ')
+    reply = input('\nRun brew upgrade --cask? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.run(('brew', 'cask', 'upgrade'))
+        subprocess.run(('brew', 'upgrade', '--cask'), check=True)
 
     print('\nRunning brew cleanup...')
-    subprocess.run(('brew', 'cleanup'))
+    subprocess.run(('brew', 'cleanup'), check=True)
 
     print('\npip3 list -o:')
     outdated = json.loads(
-        subprocess.run(('pip3', 'list', '-o', '--format', 'json'),
-                       stdout=subprocess.PIPE).stdout)
+        subprocess.run(('pip3', 'list', '-o', '--format', 'json'), check=True,
+                       stdout=subprocess.PIPE, encoding='utf8').stdout)
     to_update = []
     for package in outdated:
         name = package['name']
@@ -60,9 +59,17 @@ def main():
                        headers='firstrow'))
         to_update = [row[0] for row in to_update]
         reply = input('\nRun pip3 install -U {}? [Y/n]: '.format(
-            ', '.join(to_update)))
+            ' '.join(to_update)))
         if reply not in ('N', 'n'):
-            subprocess.run(['pip3', 'install', '-U'] + to_update)
+            subprocess.run(['pip3', 'install', '-U'] + to_update, check=True)
+            result = subprocess.run(('pip3', 'check'), stdout=subprocess.PIPE,
+                                    encoding='utf8', check=False)
+            if result.returncode != 0:
+                to_fix = [row.split(maxsplit=1)[0]
+                          for row in result.stdout.splitlines()]
+                print('Fixing broken pip dependencies')
+                print(f'pip3 install -U {" ".join(to_fix)}')
+                subprocess.run(['pip3', 'install', '-U'] + to_fix, check=True)
 
 
 if __name__ == '__main__':
