@@ -10,17 +10,16 @@ from tabulate import tabulate
 #   brew update
 #   brew outdated
 #   brew upgrade --build-from-source
-#   brew outdated --cask
-#   brew upgrade --cask
 #   brew cleanup
 #   pip3 list -o
 #   pip3 install -U
+#   pip3 check | cut -d ' ' -f1 | xargs pip3 install -U
 
 
-PIP_SKIP = ('inventory', 'utils', 'pycodestyle', 'pyflakes')
+PIP_SKIP = ('inventory', 'utils')
 
 
-def main():
+def update_sw():
     print('Updating brew...')
     subprocess.run(('brew', 'update'), check=True)
 
@@ -30,13 +29,6 @@ def main():
     reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
         subprocess.run(('brew', 'upgrade', '--build-from-source'), check=True)
-
-    print('\nbrew outdated --cask:')
-    subprocess.run(('brew', 'outdated', '--cask'), check=True)
-
-    reply = input('\nRun brew upgrade --cask? [Y/n]: ')
-    if reply not in ('N', 'n'):
-        subprocess.run(('brew', 'upgrade', '--cask'), check=True)
 
     print('\nRunning brew cleanup...')
     subprocess.run(('brew', 'cleanup'), check=True)
@@ -70,6 +62,14 @@ def main():
                 print('Fixing broken pip dependencies')
                 print(f'pip3 install -U {" ".join(to_fix)}')
                 subprocess.run(['pip3', 'install', '-U'] + to_fix, check=True)
+
+
+def main():
+    try:
+        update_sw()
+    except subprocess.CalledProcessError as ex:
+        print(ex, file=sys.stderr)
+        return ex.returncode
 
 
 if __name__ == '__main__':
