@@ -13,7 +13,7 @@ from tabulate import tabulate
 #   brew cleanup
 #   pip3 list -o
 #   pip3 install -U
-#   pip3 check | cut -d ' ' -f1 | xargs pip3 install -U
+#   pip3 check | cut -d ' ' -f1 | xargs pip3 install
 
 
 PIP_SKIP = ('inventory', 'utils')
@@ -60,8 +60,8 @@ def update_sw():
                 to_fix = [row.split(maxsplit=1)[0]
                           for row in result.stdout.splitlines()]
                 print('Fixing broken pip dependencies')
-                print(f'pip3 install -U {" ".join(to_fix)}')
-                subprocess.run(['pip3', 'install', '-U'] + to_fix, check=True)
+                print(f'pip3 install {" ".join(to_fix)}')
+                subprocess.run(['pip3', 'install'] + to_fix, check=True)
 
 
 def main():
