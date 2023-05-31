@@ -28,7 +28,7 @@ def update_sw():
 
     reply = input('\nRun brew upgrade? [Y/n]: ')
     if reply not in ('N', 'n'):
-        subprocess.run(('brew', 'upgrade', '--build-from-source'), check=True)
+        subprocess.run(('brew', 'upgrade'), check=True)
 
     print('\nRunning brew cleanup...')
     subprocess.run(('brew', 'cleanup'), check=True)
