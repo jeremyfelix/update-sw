@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from abc import abstractmethod, ABC
 import argparse
 import json
 import logging
@@ -63,6 +64,130 @@ def configure_logging(args, use_stdout=False):
 PIP_SKIP = ('inventory', 'utils')
 
 
+class Updater(ABC):
+    @property
+    @abstractmethod
+    def update_cmd(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def outdated_cmd(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        raise NotImplementedError
+
+    @property
+    def update_banner(self) -> str:
+        return 'Updating...'
+
+    @property
+    def outdated_banner(self) -> str:
+        return 'Outdated:'
+
+    @property
+    def upgrade_prompt(self) -> str:
+        return 'Run upgrade? [Y/n]: '
+
+    @property
+    def cleanup_banner(self) -> str:
+        return 'Running cleanup...'
+
+    def update(self):
+        print(self.update_banner)
+        logging.debug(self.update_cmd)
+        subprocess.run(self.update_cmd, check=True)
+
+    def outdated(self):
+        print(self.outdated_banner)
+        logging.debug(self.outdated_cmd)
+        subprocess.run(self.outdated_cmd, check=True)
+
+    def upgrade(self):
+        reply = input(self.upgrade_prompt)
+        if reply not in ('N', 'n'):
+            logging.debug(self.upgrade_cmd)
+            subprocess.run(self.upgrade_cmd, check=True)
+
+    def cleanup(self):
+        print(self.cleanup_banner)
+        logging.debug(self.cleanup_cmd)
+        subprocess.run(self.cleanup_cmd, check=True)
+
+    def run(self):
+        self.update()
+        print()
+        self.outdated()
+        print()
+        self.upgrade()
+        print()
+        self.cleanup()
+
+
+class BrewUpdater(Updater):
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ('brew', 'update')
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ('brew', 'outdated')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('brew', 'upgrade')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ('brew', 'cleanup')
+
+
+class AptUpdater(Updater):
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ('/usr/bin/apt', 'update')
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ('/usr/bin/apt', 'outdated')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('/usr/bin/apt', 'upgrade')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ('/usr/bin/apt', 'autoremove')
+
+
+class EmergeUpdater(Updater):
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ('sudo', '/usr/bin/nice', '/usr/bin/eix-sync')
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-pvuUD', '@world')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('ntfy', 'done', '-L', '60', 'sudo', '/usr/bin/nice',
+                '/usr/bin/emerge', '-avuUD', '@world')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av',
+                '--depclean')
+
+
 def update_brew():
     print('Updating brew...')
     subprocess.run(('brew', 'update'), check=True)
@@ -112,9 +237,19 @@ def update_pip(pip: str | None = 'pip3'):
 
 
 def update_sw():
-    if platform.system() == 'Darwin':
-        update_brew()
-    # If Linux, check if for ubuntu vs. gentoo.
+    match platform.system():
+        case 'Darwin':
+            # update_brew()
+            BrewUpdater().run()
+        case 'Linux':
+            import distro  # type: ignore
+            # If Linux, check if for ubuntu vs. gentoo.
+            match distro.id():
+                case 'gentoo':
+                    pass
+                    EmergeUpdater().run()
+                case 'rasbian' | 'ubuntu':
+                    AptUpdater().run()
 
 
 def main():
