@@ -1,15 +1,59 @@
 #!/usr/bin/env python3
 
+import argparse
 import json
+import logging
+import platform
 import subprocess
 import sys
 
 from tabulate import tabulate
 
+
+def create_parser():
+    """Create command line parser."""
+
+    description = 'Updates sw on my various platforms'
+
+    parser = argparse.ArgumentParser(description=description)
+
+    parser.add_argument('-p', '--pip-only', action='store_true',
+                        help='only update pip packages')
+    parser.add_argument('-P', '--pip-bin',
+                        help='path to pip binary to use [default: pip3 from '
+                        'PATH]')
+    parser.add_argument('-v', '--verbose', action='count',
+                        help='Verbose output, repeat for increased verbosity')
+    return parser
+
+
+def parse_args():
+    """Parse command line arguments."""
+
+    parser = create_parser()
+    args = parser.parse_args()
+
+    return args
+
+
+def configure_logging(args, use_stdout=False):
+    """Set up logging based on command line options."""
+
+    if not args.verbose:
+        log_level = logging.WARNING  # Logs calls to logging.warning and above.
+    elif args.verbose == 1:
+        log_level = logging.INFO     # Logs calls to logging.info and above.
+    else:
+        log_level = logging.DEBUG    # Logs calls to logging.debug and above.
+
+    stream = sys.stdout if use_stdout else sys.stderr
+    logging.basicConfig(level=log_level, format='%(message)s', stream=stream)
+    logging.debug(args)
+
 # Runs the following commands:
 #   brew update
 #   brew outdated
-#   brew upgrade --build-from-source
+#   brew upgrade
 #   brew cleanup
 #   pip3 list -o
 #   pip3 install -U
@@ -19,7 +63,7 @@ from tabulate import tabulate
 PIP_SKIP = ('inventory', 'utils')
 
 
-def update_sw():
+def update_brew():
     print('Updating brew...')
     subprocess.run(('brew', 'update'), check=True)
 
@@ -33,9 +77,13 @@ def update_sw():
     print('\nRunning brew cleanup...')
     subprocess.run(('brew', 'cleanup'), check=True)
 
-    print('\npip3 list -o:')
+
+def update_pip(pip: str | None = 'pip3'):
+    if pip is None:
+        pip = 'pip3'
+    print(f'\n{pip} list -o:')
     outdated = json.loads(
-        subprocess.run(('pip3', 'list', '-o', '--format', 'json'), check=True,
+        subprocess.run((pip, 'list', '-o', '--format', 'json'), check=True,
                        stdout=subprocess.PIPE, encoding='utf8').stdout)
     to_update = []
     for package in outdated:
@@ -50,26 +98,38 @@ def update_sw():
         print(tabulate([('Package', 'Version', 'Latest')] + to_update,
                        headers='firstrow'))
         to_update = [row[0] for row in to_update]
-        reply = input('\nRun pip3 install -U {}? [Y/n]: '.format(
-            ' '.join(to_update)))
+        reply = input(f'\nRun {pip} install -U {" ".join(to_update)}')
         if reply not in ('N', 'n'):
-            subprocess.run(['pip3', 'install', '-U'] + to_update, check=True)
-            result = subprocess.run(('pip3', 'check'), stdout=subprocess.PIPE,
+            subprocess.run([pip, 'install', '-U'] + to_update, check=True)
+            result = subprocess.run((pip, 'check'), stdout=subprocess.PIPE,
                                     encoding='utf8', check=False)
             if result.returncode != 0:
                 to_fix = [row.split(maxsplit=1)[0]
                           for row in result.stdout.splitlines()]
                 print('Fixing broken pip dependencies')
-                print(f'pip3 install {" ".join(to_fix)}')
-                subprocess.run(['pip3', 'install'] + to_fix, check=True)
+                print(f'{pip} install {" ".join(to_fix)}')
+                subprocess.run([pip, 'install'] + to_fix, check=True)
+
+
+def update_sw():
+    if platform.system() == 'Darwin':
+        update_brew()
+    # If Linux, check if for ubuntu vs. gentoo.
 
 
 def main():
+    args = parse_args()
+    configure_logging(args)
+
     try:
-        update_sw()
+        if not args.pip_only:
+            update_sw()
+        update_pip(args.pip_bin)
     except subprocess.CalledProcessError as ex:
         print(ex, file=sys.stderr)
         return ex.returncode
+
+    return 0
 
 
 if __name__ == '__main__':
