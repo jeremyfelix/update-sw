@@ -102,22 +102,30 @@ class Updater(ABC):
         return 'Running cleanup...'
 
     def update(self):
+        if not self.update_cmd:
+            return
         print(self.update_banner)
         logging.debug(self.update_cmd)
         subprocess.run(self.update_cmd, check=True)
 
     def outdated(self):
+        if not self.outdated_cmd:
+            return
         print(self.outdated_banner)
         logging.debug(self.outdated_cmd)
         subprocess.run(self.outdated_cmd, check=True)
 
     def upgrade(self):
+        if not self.upgrade_cmd:
+            return
         reply = input(self.upgrade_prompt)
         if reply not in ('N', 'n'):
             logging.debug(self.upgrade_cmd)
             subprocess.run(self.upgrade_cmd, check=True)
 
     def cleanup(self):
+        if not self.cleanup_cmd:
+            return
         print(self.cleanup_banner)
         logging.debug(self.cleanup_cmd)
         subprocess.run(self.cleanup_cmd, check=True)
@@ -175,7 +183,7 @@ class EmergeUpdater(Updater):
 
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-pvuUD', '@world')
+        return ()
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
