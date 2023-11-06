@@ -234,7 +234,7 @@ def update_pip(pip: str | None = 'pip3'):
         print(tabulate([('Package', 'Version', 'Latest')] + to_update,
                        headers='firstrow'))
         to_update = [row[0] for row in to_update]
-        reply = input(f'\nRun {pip} install -U {" ".join(to_update)}')
+        reply = input(f'\nRun {pip} install -U {" ".join(to_update)}? [Y/n]: ')
         if reply not in ('N', 'n'):
             subprocess.run([pip, 'install', '-U'] + to_update, check=True)
             result = subprocess.run((pip, 'check'), stdout=subprocess.PIPE,
