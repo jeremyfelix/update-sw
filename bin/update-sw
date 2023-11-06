@@ -164,19 +164,19 @@ class BrewUpdater(Updater):
 class AptUpdater(Updater):
     @property
     def update_cmd(self) -> tuple[str, ...]:
-        return ('/usr/bin/apt', 'update')
+        return ('sudo', '/usr/bin/apt', 'update')
 
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
-        return ('/usr/bin/apt', 'outdated')
+        return ('/usr/bin/apt', 'list', '--upgradeable')
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('/usr/bin/apt', 'upgrade')
+        return ('sudo', '/usr/bin/apt', 'upgrade')
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
-        return ('/usr/bin/apt', 'autoremove')
+        return ('sudo', '/usr/bin/apt', 'autoremove')
 
 
 class EmergeUpdater(Updater):
