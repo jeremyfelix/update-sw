@@ -23,6 +23,8 @@ def create_parser():
     parser.add_argument('-P', '--pip-bin',
                         help='path to pip binary to use [default: pip3 from '
                         'PATH]')
+    parser.add_argument('-s', '--skip-update', action='store_true',
+                        help='skip running update command')
     parser.add_argument('-v', '--verbose', action='count',
                         help='Verbose output, repeat for increased verbosity')
     return parser
@@ -130,9 +132,10 @@ class Updater(ABC):
         logging.debug(self.cleanup_cmd)
         subprocess.run(self.cleanup_cmd, check=True)
 
-    def run(self):
-        self.update()
-        print()
+    def run(self, skip_update: bool = False):
+        if not skip_update:
+            self.update()
+            print()
         self.outdated()
         print()
         self.upgrade()
@@ -244,20 +247,20 @@ def update_pip(pip: str | None = 'pip3'):
                 subprocess.run([pip, 'install'] + to_fix, check=True)
 
 
-def update_sw():
+def update_sw(skip_update: bool):
     match platform.system():
         case 'Darwin':
             # update_brew()
-            BrewUpdater().run()
+            BrewUpdater().run(skip_update)
         case 'Linux':
             import distro  # type: ignore
             # If Linux, check if for ubuntu vs. gentoo.
             match distro.id():
                 case 'gentoo':
                     pass
-                    EmergeUpdater().run()
+                    EmergeUpdater().run(skip_update)
                 case 'rasbian' | 'ubuntu':
-                    AptUpdater().run()
+                    AptUpdater().run(skip_update)
 
 
 def main():
@@ -266,7 +269,7 @@ def main():
 
     try:
         if not args.pip_only:
-            update_sw()
+            update_sw(args.skip_update)
         update_pip(args.pip_bin)
     except subprocess.CalledProcessError as ex:
         print(ex, file=sys.stderr)
