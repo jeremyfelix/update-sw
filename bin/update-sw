@@ -4,6 +4,7 @@ from abc import abstractmethod, ABC
 import argparse
 import json
 import logging
+from pathlib import Path
 import platform
 import subprocess
 import sys
@@ -68,6 +69,10 @@ PIP_SKIP = ('inventory', 'utils')
 
 class Updater(ABC):
     @property
+    def name(self) -> str:
+        raise NotImplementedError
+
+    @property
     @abstractmethod
     def update_cmd(self) -> tuple[str, ...]:
         raise NotImplementedError
@@ -89,19 +94,19 @@ class Updater(ABC):
 
     @property
     def update_banner(self) -> str:
-        return 'Updating...'
+        return f'Updating ({self.name})...'
 
     @property
     def outdated_banner(self) -> str:
-        return 'Outdated:'
+        return f'Outdated ({self.name}):'
 
     @property
     def upgrade_prompt(self) -> str:
-        return 'Run upgrade? [Y/n]: '
+        return f'Run upgrade ({self.name})? [Y/n]: '
 
     @property
     def cleanup_banner(self) -> str:
-        return 'Running cleanup...'
+        return f'Running cleanup ({self.name})...'
 
     def update(self):
         if not self.update_cmd:
@@ -145,6 +150,10 @@ class Updater(ABC):
 
 class BrewUpdater(Updater):
     @property
+    def name(self) -> str:
+        return 'brew'
+
+    @property
     def update_cmd(self) -> tuple[str, ...]:
         return ('brew', 'update')
 
@@ -162,6 +171,10 @@ class BrewUpdater(Updater):
 
 
 class AptUpdater(Updater):
+    @property
+    def name(self) -> str:
+        return 'apt'
+
     @property
     def update_cmd(self) -> tuple[str, ...]:
         return ('sudo', '/usr/bin/apt', 'update')
@@ -181,6 +194,10 @@ class AptUpdater(Updater):
 
 class EmergeUpdater(Updater):
     @property
+    def name(self) -> str:
+        return 'emerge'
+
+    @property
     def update_cmd(self) -> tuple[str, ...]:
         return ('sudo', '/usr/bin/nice', '/usr/bin/eix-sync')
 
@@ -199,52 +216,68 @@ class EmergeUpdater(Updater):
                 '--depclean')
 
 
-def update_brew():
-    print('Updating brew...')
-    subprocess.run(('brew', 'update'), check=True)
+class PipUpdater(Updater):
+    def __init__(self, pip_path: str | Path | None = 'pip3'):
+        self.pip = pip_path if pip_path is not None else 'pip3'
+        self._to_update: list[str] = []
 
-    print('\nbrew outdated:')
-    subprocess.run(('brew', 'outdated'), check=True)
+    @property
+    def name(self) -> str:
+        return 'pip'
 
-    reply = input('\nRun brew upgrade? [Y/n]: ')
-    if reply not in ('N', 'n'):
-        subprocess.run(('brew', 'upgrade'), check=True)
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ()
 
-    print('\nRunning brew cleanup...')
-    subprocess.run(('brew', 'cleanup'), check=True)
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ()
 
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ()
 
-def update_pip(pip: str | None = 'pip3'):
-    if pip is None:
-        pip = 'pip3'
-    print(f'\n{pip} list -o:')
-    outdated = json.loads(
-        subprocess.run((pip, 'list', '-o', '--format', 'json'), check=True,
-                       stdout=subprocess.PIPE, encoding='utf8').stdout)
-    to_update = []
-    for package in outdated:
-        name = package['name']
-        if name in PIP_SKIP:
-            print('Skipping {name}'.format_map(package))
-        else:
-            to_update.append(
-                (name, package['version'], package['latest_version']))
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ()
 
-    if to_update:
-        print(tabulate([('Package', 'Version', 'Latest')] + to_update,
-                       headers='firstrow'))
-        to_update = [row[0] for row in to_update]
-        reply = input(f'\nRun {pip} install -U {" ".join(to_update)}? [Y/n]: ')
-        if reply not in ('N', 'n'):
-            subprocess.run([pip, 'install', '-U'] + to_update, check=True)
-            result = subprocess.run((pip, 'check'), stdout=subprocess.PIPE,
-                                    encoding='utf8', check=False)
-            if result.returncode != 0:
-                to_fix = [row.split(maxsplit=1)[0]
-                          for row in result.stdout.splitlines()]
-                print('Fixing broken pip dependencies')
-                print(f'{pip} install {" ".join(to_fix)}')
-                subprocess.run([pip, 'install'] + to_fix, check=True)
+    def outdated(self):
+        print(self.outdated_banner)
+        outdated = json.loads(
+            subprocess.run((self.pip, 'list', '-o', '--format', 'json'),
+                           check=True, stdout=subprocess.PIPE,
+                           encoding='utf8').stdout)
+        to_update = []
+        for package in outdated:
+            name = package['name']
+            if name in PIP_SKIP:
+                print('Skipping {name}'.format_map(package))
+            else:
+                to_update.append(
+                    (name, package['version'], package['latest_version']))
+
+        if to_update:
+            print(tabulate([('Package', 'Version', 'Latest')] + to_update,
+                           headers='firstrow'))
+            self._to_update = [row[0] for row in to_update]
+
+    def upgrade(self):
+        if not self._to_update:
+            return
+        reply = input(self.upgrade_prompt)
+        if reply in ('N', 'n'):
+            return
+        logging.debug([self.pip, 'install', '-U'] + self._to_update)
+        subprocess.run([self.pip, 'install', '-U'] + self._to_update,
+                       check=True)
+        result = subprocess.run((self.pip, 'check'), stdout=subprocess.PIPE,
+                                encoding='utf8', check=False)
+        if result.returncode != 0:
+            to_fix = [row.split(maxsplit=1)[0]
+                      for row in result.stdout.splitlines()]
+            print('Fixing broken pip dependencies')
+            print(f'{self.pip} install {" ".join(to_fix)}')
+            subprocess.run([self.pip, 'install'] + to_fix, check=True)
 
 
 def update_sw(skip_update: bool):
@@ -270,7 +303,7 @@ def main():
     try:
         if not args.pip_only:
             update_sw(args.skip_update)
-        update_pip(args.pip_bin)
+        PipUpdater(args.pip_bin).run()
     except subprocess.CalledProcessError as ex:
         print(ex, file=sys.stderr)
         return ex.returncode
