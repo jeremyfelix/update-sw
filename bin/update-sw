@@ -71,6 +71,64 @@ class Updater(ABC):
         raise NotImplementedError
 
     @property
+    def update_banner(self) -> str:
+        return f'Updating ({self.name})...'
+
+    @property
+    def outdated_banner(self) -> str:
+        return f'Outdated ({self.name}):'
+
+    @property
+    def upgrade_prompt(self) -> str:
+        return f'Run upgrade ({self.name})? [Y/n]: '
+
+    @property
+    def cleanup_banner(self) -> str:
+        return f'Running cleanup ({self.name})...'
+
+    def _update(self):
+        raise NotImplementedError
+
+    def _outdated(self):
+        raise NotImplementedError
+
+    def _upgrade(self):
+        raise NotImplementedError
+
+    def _cleanup(self):
+        raise NotImplementedError
+
+    def update(self):
+        print(self.update_banner)
+        self._update()
+        print()
+
+    def outdated(self):
+        print(self.outdated_banner)
+        self._outdated()
+        print()
+
+    def upgrade(self):
+        reply = input(self.upgrade_prompt)
+        if reply not in ('N', 'n'):
+            self._upgrade()
+        print()
+
+    def cleanup(self):
+        print(self.cleanup_banner)
+        self._cleanup()
+        print()
+
+    def run(self, skip_update: bool = False):
+        if not skip_update:
+            self.update()
+        self.outdated()
+        self.upgrade()
+        self.cleanup()
+
+
+class CommandBasedUpdater(Updater):
+    @property
     @abstractmethod
     def update_cmd(self) -> tuple[str, ...]:
         raise NotImplementedError
@@ -90,63 +148,44 @@ class Updater(ABC):
     def cleanup_cmd(self) -> tuple[str, ...]:
         raise NotImplementedError
 
-    @property
-    def update_banner(self) -> str:
-        return f'Updating ({self.name})...'
+    def _update(self):
+        logging.debug(self.update_cmd)
+        subprocess.run(self.update_cmd, check=True)
 
-    @property
-    def outdated_banner(self) -> str:
-        return f'Outdated ({self.name}):'
+    def _outdated(self):
+        logging.debug(self.outdated_cmd)
+        subprocess.run(self.outdated_cmd, check=True)
 
-    @property
-    def upgrade_prompt(self) -> str:
-        return f'Run upgrade ({self.name})? [Y/n]: '
+    def _upgrade(self):
+        logging.debug(self.upgrade_cmd)
+        subprocess.run(self.upgrade_cmd, check=True)
 
-    @property
-    def cleanup_banner(self) -> str:
-        return f'Running cleanup ({self.name})...'
+    def _cleanup(self):
+        logging.debug(self.cleanup_cmd)
+        subprocess.run(self.cleanup_cmd, check=True)
 
     def update(self):
         if not self.update_cmd:
             return
-        print(self.update_banner)
-        logging.debug(self.update_cmd)
-        subprocess.run(self.update_cmd, check=True)
+        super().update()
 
     def outdated(self):
         if not self.outdated_cmd:
             return
-        print(self.outdated_banner)
-        logging.debug(self.outdated_cmd)
-        subprocess.run(self.outdated_cmd, check=True)
+        super().outdated()
 
     def upgrade(self):
         if not self.upgrade_cmd:
             return
-        reply = input(self.upgrade_prompt)
-        if reply not in ('N', 'n'):
-            logging.debug(self.upgrade_cmd)
-            subprocess.run(self.upgrade_cmd, check=True)
+        super().upgrade()
 
     def cleanup(self):
         if not self.cleanup_cmd:
             return
-        print(self.cleanup_banner)
-        logging.debug(self.cleanup_cmd)
-        subprocess.run(self.cleanup_cmd, check=True)
-
-    def run(self, skip_update: bool = False):
-        if not skip_update:
-            self.update()
-            print()
-        self.outdated()
-        print()
-        self.upgrade()
-        print()
-        self.cleanup()
+        super().cleanup()
 
 
-class BrewUpdater(Updater):
+class BrewUpdater(CommandBasedUpdater):
     @property
     def name(self) -> str:
         return 'brew'
@@ -168,7 +207,7 @@ class BrewUpdater(Updater):
         return ('brew', 'cleanup')
 
 
-class AptUpdater(Updater):
+class AptUpdater(CommandBasedUpdater):
     @property
     def name(self) -> str:
         return 'apt'
@@ -190,7 +229,7 @@ class AptUpdater(Updater):
         return ('sudo', '/usr/bin/apt', 'autoremove')
 
 
-class EmergeUpdater(Updater):
+class EmergeUpdater(CommandBasedUpdater):
     @property
     def name(self) -> str:
         return 'emerge'
@@ -225,24 +264,18 @@ class PipUpdater(Updater):
     def name(self) -> str:
         return 'pip'
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ()
+    def update(self):
+        pass
 
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ()
+    def cleanup(self):
+        pass
 
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ()
+    def upgrade(self):
+        if not self._to_update:
+            return
+        super().upgrade()
 
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    def outdated(self):
-        print(self.outdated_banner)
+    def _outdated(self):
         outdated = json.loads(
             subprocess.run((self.pip, 'list', '-o', '--format', 'json'),
                            check=True, stdout=subprocess.PIPE,
@@ -261,11 +294,8 @@ class PipUpdater(Updater):
                            headers='firstrow'))
             self._to_update = [row[0] for row in to_update]
 
-    def upgrade(self):
+    def _upgrade(self):
         if not self._to_update:
-            return
-        reply = input(self.upgrade_prompt)
-        if reply in ('N', 'n'):
             return
         logging.debug([self.pip, 'install', '-U'] + self._to_update)
         subprocess.run([self.pip, 'install', '-U'] + self._to_update,
