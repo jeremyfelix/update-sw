@@ -54,7 +54,8 @@ def configure_logging(args, use_stdout=False):
     logging.basicConfig(level=log_level, format='%(message)s', stream=stream)
     logging.debug(args)
 
-# Runs the following commands:
+
+# Runs roughly the following commands:
 #   brew update
 #   brew outdated
 #   brew upgrade
@@ -62,9 +63,6 @@ def configure_logging(args, use_stdout=False):
 #   pip3 list -o
 #   pip3 install -U
 #   pip3 check | cut -d ' ' -f1 | xargs pip3 install
-
-
-PIP_SKIP = ('inventory', 'utils')
 
 
 class Updater(ABC):
@@ -217,6 +215,8 @@ class EmergeUpdater(Updater):
 
 
 class PipUpdater(Updater):
+    PIP_SKIP = ('inventory', 'utils')
+
     def __init__(self, pip_path: str | Path | None = 'pip3'):
         self.pip = pip_path if pip_path is not None else 'pip3'
         self._to_update: list[str] = []
@@ -250,7 +250,7 @@ class PipUpdater(Updater):
         to_update = []
         for package in outdated:
             name = package['name']
-            if name in PIP_SKIP:
+            if name in self.PIP_SKIP:
                 print('Skipping {name}'.format_map(package))
             else:
                 to_update.append(
@@ -283,7 +283,6 @@ class PipUpdater(Updater):
 def update_sw(skip_update: bool):
     match platform.system():
         case 'Darwin':
-            # update_brew()
             BrewUpdater().run(skip_update)
         case 'Linux':
             import distro  # type: ignore
