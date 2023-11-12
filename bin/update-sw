@@ -319,10 +319,15 @@ def update_sw(skip_update: bool):
             # If Linux, check if for ubuntu vs. gentoo.
             match distro.id():
                 case 'gentoo':
-                    pass
                     EmergeUpdater().run(skip_update)
-                case 'rasbian' | 'ubuntu':
+                case 'rasbian':
                     AptUpdater().run(skip_update)
+                case 'ubuntu':
+                    if 'microsoft-standard-WSL' in platform.uname().release:
+                        subprocess.run(['explorer.exe',
+                                        'ms-settings:windowsupdate'])
+                    AptUpdater().run(skip_update)
+
 
 
 def main():
