@@ -334,9 +334,10 @@ class PyenvUpdater(CommandBasedUpdater):
     @staticmethod
     def has_pyenv() -> bool:
         try:
-            subprocess.run(('pyenv', '--version'), check=True)
+            subprocess.run(('pyenv', '--version'), check=True,
+                           stdout=subprocess.DEVNULL)
             return True
-        except subprocess.CalledProcessError:
+        except (FileNotFoundError, subprocess.CalledProcessError):
             return False
 
     @property
@@ -363,8 +364,9 @@ class PyenvUpdater(CommandBasedUpdater):
         return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
     def _outdated(self):
-        current = subprocess.run(('pyenv', 'version-name'), check=True,
-                                 capture_output=True, encoding='utf8').stdout.strip()
+        current = subprocess.run(
+            ('pyenv', 'version-name'), check=True, capture_output=True,
+            encoding='utf8').stdout.strip()
         available = subprocess.run(('pyenv', 'install', '--list'), check=True,
                                    capture_output=True, encoding='utf8').stdout
         cur_ver = self._parse_version(current)
@@ -412,7 +414,6 @@ def update_sw(skip_update: bool, skip_system_updater: bool):
                             subprocess.run(['explorer.exe',
                                             'ms-settings:windowsupdate'])
                     AptUpdater().run(skip_update)
-
 
 
 def main():
