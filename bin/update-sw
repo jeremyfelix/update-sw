@@ -396,9 +396,33 @@ class PyenvUpdater(CommandBasedUpdater):
         return ()
 
 
+class MacOsUpdater(CommandBasedUpdater):
+    @property
+    def name(self) -> str:
+        return 'macos'
+
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ('softwareupdate', '--list')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('softwareupdate', '--install', '--all')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ()
+
+
 def update_sw(skip_update: bool, skip_system_updater: bool):
     match platform.system():
         case 'Darwin':
+            if not skip_system_updater:
+                MacOsUpdater().run()
             BrewUpdater().run(skip_update)
         case 'Linux':
             import distro  # type: ignore
