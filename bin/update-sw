@@ -411,7 +411,7 @@ class MacOsUpdater(CommandBasedUpdater):
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('softwareupdate', '--install', '--all')
+        return ('sudo', 'softwareupdate', '--install', '--all', '--restart')
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
