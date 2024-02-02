@@ -2,13 +2,16 @@
 
 from abc import abstractmethod, ABC
 import argparse
+from collections.abc import Sequence
 import json
 import logging
 from pathlib import Path
 import platform
 import re
+from io import StringIO
 import subprocess
 import sys
+from typing import cast, TextIO
 
 from tabulate import tabulate
 
@@ -135,6 +138,24 @@ class Updater(ABC):
 
 
 class CommandBasedUpdater(Updater):
+    @staticmethod
+    def _run_with_output(args: Sequence[str]) -> str:
+        with (subprocess.Popen(args, stdout=subprocess.PIPE, bufsize=1,
+                               encoding='utf8', text=True) as p,
+              StringIO() as buf):
+            for line in cast(TextIO, p.stdout):
+                print(line, end='')
+                buf.write(line)
+            output = buf.getvalue()
+            if p.wait() != 0:
+                raise subprocess.CalledProcessError(p.returncode, args, output)
+            return output
+
+    @staticmethod
+    def _run(args: Sequence[str]):
+        logging.debug(args)
+        subprocess.run(args, check=True)
+
     @property
     @abstractmethod
     def update_cmd(self) -> tuple[str, ...]:
@@ -144,6 +165,11 @@ class CommandBasedUpdater(Updater):
     @abstractmethod
     def outdated_cmd(self) -> tuple[str, ...]:
         raise NotImplementedError
+
+    @property
+    def has_updates(self) -> bool:
+        # Override and parse self.outdated_output to skip upgrade
+        return True
 
     @property
     @abstractmethod
@@ -156,20 +182,16 @@ class CommandBasedUpdater(Updater):
         raise NotImplementedError
 
     def _update(self):
-        logging.debug(self.update_cmd)
-        subprocess.run(self.update_cmd, check=True)
+        self._run(self.update_cmd)
 
     def _outdated(self):
-        logging.debug(self.outdated_cmd)
-        subprocess.run(self.outdated_cmd, check=True)
+        self.outdated_output = self._run_with_output(self.outdated_cmd)
 
     def _upgrade(self):
-        logging.debug(self.upgrade_cmd)
-        subprocess.run(self.upgrade_cmd, check=True)
+        self._run(self.upgrade_cmd)
 
     def _cleanup(self):
-        logging.debug(self.cleanup_cmd)
-        subprocess.run(self.cleanup_cmd, check=True)
+        self._run(self.cleanup_cmd)
 
     def update(self):
         if not self.update_cmd:
@@ -184,7 +206,8 @@ class CommandBasedUpdater(Updater):
     def upgrade(self):
         if not self.upgrade_cmd:
             return
-        super().upgrade()
+        if self.has_updates:
+            super().upgrade()
 
     def cleanup(self):
         if not self.cleanup_cmd:
@@ -206,6 +229,10 @@ class BrewUpdater(CommandBasedUpdater):
         return ('brew', 'outdated')
 
     @property
+    def has_updates(self) -> bool:
+        return self.outdated_output != ''
+
+    @property
     def upgrade_cmd(self) -> tuple[str, ...]:
         return ('brew', 'upgrade')
 
@@ -223,6 +250,7 @@ class AptUpdater(CommandBasedUpdater):
     def update_cmd(self) -> tuple[str, ...]:
         return ('sudo', '/usr/bin/apt', 'update')
 
+    # TODO: Detect when no updates are available to skip upgrade
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
         return ('/usr/bin/apt', 'list', '--upgradeable')
@@ -260,6 +288,7 @@ class EmergeUpdater(CommandBasedUpdater):
                 '--depclean')
 
 
+# TODO: Skip system pip
 class PipUpdater(Updater):
     PIP_SKIP = ('inventory', 'utils')
 
@@ -342,6 +371,7 @@ class PyenvUpdater(CommandBasedUpdater):
 
     @property
     def has_update(self) -> bool:
+        """Determines if pyenv update command is available"""
         commands = subprocess.run(('pyenv', 'commands', '-h'), check=True,
                                   capture_output=True, encoding='utf8').stdout
         return 'update' in commands.splitlines()
@@ -408,6 +438,11 @@ class MacOsUpdater(CommandBasedUpdater):
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
         return ('softwareupdate', '--list')
+
+    @property
+    def has_updates(self) -> bool:
+        return not self.outdated_output.endswith(
+            'Finding available software\n')
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
