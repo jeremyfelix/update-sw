@@ -254,10 +254,13 @@ class AptUpdater(CommandBasedUpdater):
     def update_cmd(self) -> tuple[str, ...]:
         return ('sudo', '/usr/bin/apt', 'update')
 
-    # TODO: Detect when no updates are available to skip upgrade
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
         return ('/usr/bin/apt', 'list', '--upgradeable')
+
+    @property
+    def has_updates(self) -> bool:
+        return self.outdated_output != 'Listing...\n'
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
