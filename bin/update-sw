@@ -3,12 +3,14 @@
 from abc import abstractmethod, ABC
 import argparse
 from collections.abc import Sequence
+import getpass
 import json
 import logging
 from pathlib import Path
 import platform
 import re
 from io import StringIO
+import shutil
 import subprocess
 import sys
 from typing import cast, TextIO
@@ -290,17 +292,26 @@ class EmergeUpdater(CommandBasedUpdater):
                 '--depclean')
 
 
-# TODO: Skip system pip
 class PipUpdater(Updater):
     PIP_SKIP = ('inventory', 'utils')
 
-    def __init__(self, pip_path: str | Path | None = 'pip3'):
-        self.pip = pip_path if pip_path is not None else 'pip3'
+    def __init__(self, pip_path: str | Path | None = None):
+        self.pip = shutil.which(pip_path if pip_path is not None else 'pip3')
+        if self.pip is None:
+            raise ValueError(pip_path)
         self._to_update: list[str] = []
 
     @property
     def name(self) -> str:
         return 'pip'
+
+    def run(self, skip_update: bool = False):
+        owner = Path(cast(str | Path, self.pip)).owner()
+        us = getpass.getuser()
+        if owner != us:
+            print(f'Skipping python (owner: {owner}) that is not ours ({us})')
+            return
+        super().run(skip_update)
 
     def update(self):
         pass
@@ -321,7 +332,7 @@ class PipUpdater(Updater):
 
     def _outdated(self):
         outdated = json.loads(
-            subprocess.run((self.pip, 'list', '-o', '--format', 'json'),
+            subprocess.run((str(self.pip), 'list', '-o', '--format', 'json'),
                            check=True, stdout=subprocess.PIPE,
                            encoding='utf8').stdout)
         to_update = []
@@ -344,8 +355,9 @@ class PipUpdater(Updater):
         logging.debug([self.pip, 'install', '-U'] + self._to_update)
         subprocess.run([self.pip, 'install', '-U'] + self._to_update,
                        check=True)
-        result = subprocess.run((self.pip, 'check'), stdout=subprocess.PIPE,
-                                encoding='utf8', check=False)
+        result = subprocess.run((str(self.pip), 'check'),
+                                stdout=subprocess.PIPE, encoding='utf8',
+                                check=False)
         if result.returncode != 0:
             to_fix = [row.split(maxsplit=1)[0]
                       for row in result.stdout.splitlines()]
