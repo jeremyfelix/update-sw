@@ -479,7 +479,8 @@ def update_sw(skip_update: bool, skip_system_updater: bool,
             # If Linux, check if for ubuntu vs. gentoo.
             match distro.id():
                 case 'gentoo':
-                    EmergeUpdater().run(skip_update)
+                    if not skip_system_updater:
+                        EmergeUpdater().run(skip_update)
                 case 'rasbian':
                     AptUpdater().run(skip_update)
                 case 'ubuntu':
