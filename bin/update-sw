@@ -230,7 +230,7 @@ class BrewUpdater(CommandBasedUpdater):
 
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'outdated')
+        return ('brew', 'outdated', '--fetch-HEAD')
 
     @property
     def has_updates(self) -> bool:
@@ -238,7 +238,7 @@ class BrewUpdater(CommandBasedUpdater):
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'upgrade')
+        return ('brew', 'upgrade', '--fetch-HEAD')
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
