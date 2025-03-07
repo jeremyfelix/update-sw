@@ -470,6 +470,38 @@ class MacOsUpdater(CommandBasedUpdater):
         return ()
 
 
+class RustupUpdater(CommandBasedUpdater):
+    @staticmethod
+    def has_rustup() -> bool:
+        try:
+            subprocess.run(('rustup', '--version'), check=True,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
+
+    @property
+    def name(self) -> str:
+        return 'rustup'
+
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        return ('rustup', 'self', 'update')
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        return ('rustup', 'check')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('rustup', 'update')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ()
+
+
 def update_sw(skip_update: bool, skip_system_updater: bool,
               skip_appstore_updater: bool):
     match platform.system():
@@ -509,6 +541,8 @@ def main():
         if not args.pip_only:
             if PyenvUpdater.has_pyenv():
                 PyenvUpdater().run()
+            if RustupUpdater.has_rustup():
+                RustupUpdater().run()
     except subprocess.CalledProcessError as ex:
         print(ex, file=sys.stderr)
         return ex.returncode
