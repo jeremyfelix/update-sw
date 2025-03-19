@@ -501,6 +501,10 @@ class RustupUpdater(CommandBasedUpdater):
     def cleanup_cmd(self) -> tuple[str, ...]:
         return ()
 
+    @property
+    def has_updates(self) -> bool:
+        return re.search('Update available', self.outdated_output) is not None
+
 
 def update_sw(skip_update: bool, skip_system_updater: bool,
               skip_appstore_updater: bool):
