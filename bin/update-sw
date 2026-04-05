@@ -143,7 +143,7 @@ class Updater(ABC):
 
 class CommandBasedUpdater(Updater):
     @staticmethod
-    def _run_with_output(args: Sequence[str]) -> str:
+    def _run_with_output(args: Sequence[str], allowed_returncodes=()) -> str:
         with (subprocess.Popen(args, stdout=subprocess.PIPE, bufsize=1,
                                encoding='utf8', text=True) as p,
               StringIO() as buf):
@@ -151,7 +151,8 @@ class CommandBasedUpdater(Updater):
                 print(line, end='')
                 buf.write(line)
             output = buf.getvalue()
-            if p.wait() != 0:
+            returncode = p.wait()
+            if returncode != 0 and returncode not in allowed_returncodes:
                 raise subprocess.CalledProcessError(p.returncode, args, output)
             return output
 
@@ -492,6 +493,10 @@ class RustupUpdater(CommandBasedUpdater):
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
         return ('rustup', 'check')
+
+    def _outdated(self):
+        self.outdated_output = self._run_with_output(
+            self.outdated_cmd, allowed_returncodes=(100,))
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
