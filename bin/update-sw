@@ -508,7 +508,10 @@ class RustupUpdater(CommandBasedUpdater):
 
     @property
     def has_updates(self) -> bool:
-        return re.search('Update available', self.outdated_output) is not None
+        return (
+            re.search('Update available', self.outdated_output, re.IGNORECASE)
+            is not None
+        )
 
 
 def update_sw(skip_update: bool, skip_system_updater: bool,
