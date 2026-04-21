@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
-from abc import abstractmethod, ABC
 import argparse
-from collections.abc import Sequence
 import getpass
 import json
 import logging
-from pathlib import Path
 import platform
 import re
-from io import StringIO
 import shutil
 import subprocess
 import sys
-from typing import cast, TextIO
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from io import StringIO
+from pathlib import Path
+from typing import TextIO, cast
 
 from tabulate import tabulate
 
@@ -25,19 +25,38 @@ def create_parser():
 
     parser = argparse.ArgumentParser(description=description)
 
-    parser.add_argument('-p', '--pip-only', action='store_true',
-                        help='only update pip packages')
-    parser.add_argument('-P', '--pip-bin',
-                        help='path to pip binary to use [default: pip3 from '
-                        'PATH]')
-    parser.add_argument('-s', '--skip-update', action='store_true',
-                        help='skip running update command')
-    parser.add_argument('-S', '--skip-system-updater', action='store_true',
-                        help='skip running system update ui')
-    parser.add_argument('-A', '--skip-appstore-updater', action='store_true',
-                        help='skip running appstore ui')
-    parser.add_argument('-v', '--verbose', action='count',
-                        help='verbose output, repeat for increased verbosity')
+    parser.add_argument(
+        '-p', '--pip-only', action='store_true', help='only update pip packages'
+    )
+    parser.add_argument(
+        '-P',
+        '--pip-bin',
+        help='path to pip binary to use [default: pip3 from PATH]',
+    )
+    parser.add_argument(
+        '-s',
+        '--skip-update',
+        action='store_true',
+        help='skip running update command',
+    )
+    parser.add_argument(
+        '-S',
+        '--skip-system-updater',
+        action='store_true',
+        help='skip running system update ui',
+    )
+    parser.add_argument(
+        '-A',
+        '--skip-appstore-updater',
+        action='store_true',
+        help='skip running appstore ui',
+    )
+    parser.add_argument(
+        '-v',
+        '--verbose',
+        action='count',
+        help='verbose output, repeat for increased verbosity',
+    )
     return parser
 
 
@@ -56,9 +75,9 @@ def configure_logging(args, use_stdout=False):
     if not args.verbose:
         log_level = logging.WARNING  # Logs calls to logging.warning and above.
     elif args.verbose == 1:
-        log_level = logging.INFO     # Logs calls to logging.info and above.
+        log_level = logging.INFO  # Logs calls to logging.info and above.
     else:
-        log_level = logging.DEBUG    # Logs calls to logging.debug and above.
+        log_level = logging.DEBUG  # Logs calls to logging.debug and above.
 
     stream = sys.stdout if use_stdout else sys.stderr
     logging.basicConfig(level=log_level, format='%(message)s', stream=stream)
@@ -144,9 +163,16 @@ class Updater(ABC):
 class CommandBasedUpdater(Updater):
     @staticmethod
     def _run_with_output(args: Sequence[str], allowed_returncodes=()) -> str:
-        with (subprocess.Popen(args, stdout=subprocess.PIPE, bufsize=1,
-                               encoding='utf8', text=True) as p,
-              StringIO() as buf):
+        with (
+            subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                bufsize=1,
+                encoding='utf8',
+                text=True,
+            ) as p,
+            StringIO() as buf,
+        ):
             for line in cast(TextIO, p.stdout):
                 print(line, end='')
                 buf.write(line)
@@ -287,13 +313,21 @@ class EmergeUpdater(CommandBasedUpdater):
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('ntfy', 'done', '-L', '60', 'sudo', '/usr/bin/nice',
-                '/usr/bin/emerge', '-avuUD', '@world')
+        return (
+            'ntfy',
+            'done',
+            '-L',
+            '60',
+            'sudo',
+            '/usr/bin/nice',
+            '/usr/bin/emerge',
+            '-avuUD',
+            '@world',
+        )
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av',
-                '--depclean')
+        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av', '--depclean')
 
 
 class PipUpdater(Updater):
@@ -336,9 +370,13 @@ class PipUpdater(Updater):
 
     def _outdated(self):
         outdated = json.loads(
-            subprocess.run((str(self.pip), 'list', '-o', '--format', 'json'),
-                           check=True, stdout=subprocess.PIPE,
-                           encoding='utf8').stdout)
+            subprocess.run(
+                (str(self.pip), 'list', '-o', '--format', 'json'),
+                check=True,
+                stdout=subprocess.PIPE,
+                encoding='utf8',
+            ).stdout
+        )
         to_update = []
         for package in outdated:
             name = package['name']
@@ -346,25 +384,35 @@ class PipUpdater(Updater):
                 print('Skipping {name}'.format_map(package))
             else:
                 to_update.append(
-                    (name, package['version'], package['latest_version']))
+                    (name, package['version'], package['latest_version'])
+                )
 
         if to_update:
-            print(tabulate([('Package', 'Version', 'Latest')] + to_update,
-                           headers='firstrow'))
+            print(
+                tabulate(
+                    [('Package', 'Version', 'Latest')] + to_update,
+                    headers='firstrow',
+                )
+            )
             self._to_update = [row[0] for row in to_update]
 
     def _upgrade(self):
         if not self._to_update:
             return
         logging.debug([self.pip, 'install', '-U'] + self._to_update)
-        subprocess.run([self.pip, 'install', '-U'] + self._to_update,
-                       check=True)
-        result = subprocess.run((str(self.pip), 'check'),
-                                stdout=subprocess.PIPE, encoding='utf8',
-                                check=False)
+        subprocess.run(
+            [self.pip, 'install', '-U'] + self._to_update, check=True
+        )
+        result = subprocess.run(
+            (str(self.pip), 'check'),
+            stdout=subprocess.PIPE,
+            encoding='utf8',
+            check=False,
+        )
         if result.returncode != 0:
-            to_fix = [row.split(maxsplit=1)[0]
-                      for row in result.stdout.splitlines()]
+            to_fix = [
+                row.split(maxsplit=1)[0] for row in result.stdout.splitlines()
+            ]
             print('Fixing broken pip dependencies')
             print(f'{self.pip} install {" ".join(to_fix)}')
             subprocess.run([self.pip, 'install'] + to_fix, check=True)
@@ -381,8 +429,9 @@ class PyenvUpdater(CommandBasedUpdater):
     @staticmethod
     def has_pyenv() -> bool:
         try:
-            subprocess.run(('pyenv', '--version'), check=True,
-                           stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ('pyenv', '--version'), check=True, stdout=subprocess.DEVNULL
+            )
             return True
         except (FileNotFoundError, subprocess.CalledProcessError):
             return False
@@ -390,8 +439,12 @@ class PyenvUpdater(CommandBasedUpdater):
     @property
     def has_update(self) -> bool:
         """Determines if pyenv update command is available"""
-        commands = subprocess.run(('pyenv', 'commands', '-h'), check=True,
-                                  capture_output=True, encoding='utf8').stdout
+        commands = subprocess.run(
+            ('pyenv', 'commands', '-h'),
+            check=True,
+            capture_output=True,
+            encoding='utf8',
+        ).stdout
         return 'update' in commands.splitlines()
 
     @property
@@ -413,10 +466,17 @@ class PyenvUpdater(CommandBasedUpdater):
 
     def _outdated(self):
         current = subprocess.run(
-            ('pyenv', 'version-name'), check=True, capture_output=True,
-            encoding='utf8').stdout.strip()
-        available = subprocess.run(('pyenv', 'install', '--list'), check=True,
-                                   capture_output=True, encoding='utf8').stdout
+            ('pyenv', 'version-name'),
+            check=True,
+            capture_output=True,
+            encoding='utf8',
+        ).stdout.strip()
+        available = subprocess.run(
+            ('pyenv', 'install', '--list'),
+            check=True,
+            capture_output=True,
+            encoding='utf8',
+        ).stdout
         cur_ver = self._parse_version(current)
         avail_vers = []
         for avail in available.splitlines():
@@ -459,8 +519,7 @@ class MacOsUpdater(CommandBasedUpdater):
 
     @property
     def has_updates(self) -> bool:
-        return not self.outdated_output.endswith(
-            'Finding available software\n')
+        return not self.outdated_output.endswith('Finding available software\n')
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
@@ -475,9 +534,12 @@ class RustupUpdater(CommandBasedUpdater):
     @staticmethod
     def has_rustup() -> bool:
         try:
-            subprocess.run(('rustup', '--version'), check=True,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ('rustup', '--version'),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return True
         except (FileNotFoundError, subprocess.CalledProcessError):
             return False
@@ -496,7 +558,8 @@ class RustupUpdater(CommandBasedUpdater):
 
     def _outdated(self):
         self.outdated_output = self._run_with_output(
-            self.outdated_cmd, allowed_returncodes=(100,))
+            self.outdated_cmd, allowed_returncodes=(100,)
+        )
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
@@ -514,8 +577,9 @@ class RustupUpdater(CommandBasedUpdater):
         )
 
 
-def update_sw(skip_update: bool, skip_system_updater: bool,
-              skip_appstore_updater: bool):
+def update_sw(
+    skip_update: bool, skip_system_updater: bool, skip_appstore_updater: bool
+):
     match platform.system():
         case 'Darwin':
             if not skip_system_updater:
@@ -523,6 +587,7 @@ def update_sw(skip_update: bool, skip_system_updater: bool,
             BrewUpdater().run(skip_update)
         case 'Linux':
             import distro  # type: ignore
+
             # If Linux, check if for ubuntu vs. gentoo.
             match distro.id():
                 case 'gentoo':
@@ -533,11 +598,13 @@ def update_sw(skip_update: bool, skip_system_updater: bool,
                 case 'ubuntu':
                     if 'microsoft-standard-WSL' in platform.uname().release:
                         if not skip_system_updater:
-                            subprocess.run(['explorer.exe',
-                                            'ms-settings:windowsupdate'])
+                            subprocess.run(
+                                ['explorer.exe', 'ms-settings:windowsupdate']
+                            )
                         if not skip_appstore_updater:
-                            subprocess.run(['explorer.exe',
-                                           'ms-windows-store:'])
+                            subprocess.run(
+                                ['explorer.exe', 'ms-windows-store:']
+                            )
                     AptUpdater().run(skip_update)
 
 
@@ -547,8 +614,11 @@ def main():
 
     try:
         if not args.pip_only:
-            update_sw(args.skip_update, args.skip_system_updater,
-                      args.skip_appstore_updater)
+            update_sw(
+                args.skip_update,
+                args.skip_system_updater,
+                args.skip_appstore_updater,
+            )
         PipUpdater(args.pip_bin).run()
         if not args.pip_only:
             if PyenvUpdater.has_pyenv():
