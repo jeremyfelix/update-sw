@@ -265,7 +265,7 @@ class BrewUpdater(CommandBasedUpdater):
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'upgrade', '--fetch-HEAD')
+        return ('brew', 'upgrade', '--yes', '--fetch-HEAD')
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
