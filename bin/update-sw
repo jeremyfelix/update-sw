@@ -325,18 +325,65 @@ class EmergeUpdater(CommandBasedUpdater):
         return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av', '--depclean')
 
 
-class PipUpdater(Updater):
+def classify_version(name: str) -> tuple[str, tuple[int, int, int]] | None:
+    cpython_match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', name)
+    if cpython_match:
+        return 'cpython', (
+            int(cpython_match.group(1)),
+            int(cpython_match.group(2)),
+            int(cpython_match.group(3)),
+        )
+    pypy_match = re.fullmatch(r'pypy(\d+)(?:\.\d+)?-(\d+)\.(\d+)\.(\d+)', name)
+    if pypy_match:
+        return 'pypy' + pypy_match.group(1), (
+            int(pypy_match.group(2)),
+            int(pypy_match.group(3)),
+            int(pypy_match.group(4)),
+        )
+    return None
+
+
+def latest_per_flavor(
+    names: list[str],
+) -> dict[str, tuple[str, tuple[int, int, int]]]:
+    latest: dict[str, tuple[str, tuple[int, int, int]]] = {}
+    for name in names:
+        classified = classify_version(name.strip())
+        if classified is None:
+            continue
+        flavor, key = classified
+        if flavor not in latest or key > latest[flavor][1]:
+            latest[flavor] = (name.strip(), key)
+    return latest
+
+
+def _pyenv_lines(args: tuple[str, ...]) -> list[str]:
+    return subprocess.run(
+        args, check=True, capture_output=True, encoding='utf8'
+    ).stdout.splitlines()
+
+
+def pyenv_latest_versions() -> list[str]:
+    """Return the newest installed pyenv version name for each flavor."""
+    latest = latest_per_flavor(
+        _pyenv_lines(('pyenv', 'versions', '--bare', '--skip-aliases'))
+    )
+    return [name for (name, key) in latest.values()]
+
+
+class SinglePipUpdater(Updater):
     PIP_SKIP = ('inventory', 'utils')
 
-    def __init__(self, pip_path: str | Path | None = None):
-        self.pip = shutil.which(pip_path if pip_path is not None else 'pip3')
+    def __init__(self, pip_path: str | Path, label: str | None = None):
+        self.pip = shutil.which(pip_path)
         if self.pip is None:
             raise ValueError(pip_path)
+        self._label = label
         self._to_update: list[str] = []
 
     @property
     def name(self) -> str:
-        return 'pip'
+        return f'pip ({self._label})' if self._label else 'pip'
 
     def run(self, skip_update: bool = False):
         owner = Path(cast(str | Path, self.pip)).owner()
@@ -464,52 +511,24 @@ class PyenvUpdater(CommandBasedUpdater):
             raise ValueError(f'"{ver_str}" does not match expected format')
         return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
-    def _classify(self, name: str) -> tuple[str, tuple[int, int, int]] | None:
-        cpython_match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', name)
-        if cpython_match:
-            return 'cpython', (
-                int(cpython_match.group(1)),
-                int(cpython_match.group(2)),
-                int(cpython_match.group(3)),
-            )
-        pypy_match = re.fullmatch(r'pypy(\d+)(?:\.\d+)?-(\d+)\.(\d+)\.(\d+)', name)
-        if pypy_match:
-            return 'pypy' + pypy_match.group(1), (
-                int(pypy_match.group(2)),
-                int(pypy_match.group(3)),
-                int(pypy_match.group(4)),
-            )
-        return None
-
-    def _latest_by_flavor(
-        self, names: list[str]
-    ) -> dict[str, tuple[str, tuple[int, int, int]]]:
-        latest: dict[str, tuple[str, tuple[int, int, int]]] = {}
-        for name in names:
-            classified = self._classify(name.strip())
-            if classified is None:
-                continue
-            flavor, key = classified
-            if flavor not in latest or key > latest[flavor][1]:
-                latest[flavor] = (name.strip(), key)
-        return latest
+    def _venvs_on(self, base: str) -> list[str]:
+        try:
+            lines = _pyenv_lines(('pyenv', 'virtualenvs', '--bare', '--skip-aliases'))
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return []
+        prefix = f'{base}/envs/'
+        return [
+            line.strip()[len(prefix) :]
+            for line in lines
+            if line.strip().startswith(prefix)
+        ]
 
     def _outdated(self):
-        installed = subprocess.run(
-            ('pyenv', 'versions', '--bare', '--skip-aliases'),
-            check=True,
-            capture_output=True,
-            encoding='utf8',
-        ).stdout.splitlines()
-        available = subprocess.run(
-            ('pyenv', 'install', '--list'),
-            check=True,
-            capture_output=True,
-            encoding='utf8',
-        ).stdout.splitlines()
+        installed = _pyenv_lines(('pyenv', 'versions', '--bare', '--skip-aliases'))
+        available = _pyenv_lines(('pyenv', 'install', '--list'))
 
-        current = self._latest_by_flavor(installed)
-        latest = self._latest_by_flavor(available)
+        current = latest_per_flavor(installed)
+        latest = latest_per_flavor(available)
 
         self._upgrades = []
         for flavor, (old_name, old_key) in current.items():
@@ -533,12 +552,81 @@ class PyenvUpdater(CommandBasedUpdater):
                 f'Run upgrade ({self.name}: {old} -> {new})? [Y/n]: '
             )
             if reply not in ('N', 'n'):
-                self._run(('update-python', new, old))
+                venvs = self._venvs_on(old)
+                if venvs:
+                    venv_reply = input(
+                        f'Migrate {len(venvs)} virtualenv(s) on {old} '
+                        f'({", ".join(venvs)}) to {new}? [Y/n]: '
+                    )
+                    if venv_reply not in ('N', 'n'):
+                        self._run(('update-python', '--migrate-venvs', new, old))
+                    else:
+                        self._run(('update-python', new, old))
+                else:
+                    self._run(('update-python', new, old))
         print()
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
         return ()
+
+
+class PipUpdater(Updater):
+    # Pyenv virtualenv names to also keep updated (opt-in; not auto-discovered).
+    PIP_VENVS: tuple[str, ...] = ()
+
+    def __init__(self, pip_bin: str | None = None):
+        self.pip_bin = pip_bin
+
+    @property
+    def name(self) -> str:
+        return 'pip'
+
+    def _target_pips(self) -> list[tuple[str, str | None]]:
+        if self.pip_bin:
+            return [(self.pip_bin, None)]
+
+        if PyenvUpdater.has_pyenv():
+            root = subprocess.run(
+                ('pyenv', 'root'),
+                check=True,
+                capture_output=True,
+                encoding='utf8',
+            ).stdout.strip()
+            candidates = [
+                (version, f'{root}/versions/{version}/bin/pip')
+                for version in pyenv_latest_versions()
+            ] + [
+                (venv, f'{root}/versions/{venv}/bin/pip')
+                for venv in self.PIP_VENVS
+            ]
+            return [
+                (path, label)
+                for (label, path) in candidates
+                if Path(path).exists()
+            ]
+
+        return [('pip3', None)]
+
+    def run(self, skip_update: bool = False):
+        targets = self._target_pips()
+        if not targets:
+            print('No pip targets found')
+            return
+        for path, label in targets:
+            SinglePipUpdater(path, label).run(skip_update)
+
+    def _update(self):
+        pass
+
+    def _outdated(self):
+        pass
+
+    def _upgrade(self):
+        pass
+
+    def _cleanup(self):
+        pass
 
 
 class MacOsUpdater(CommandBasedUpdater):
