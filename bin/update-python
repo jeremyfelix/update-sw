@@ -1,0 +1,28 @@
+#!/bin/bash
+
+set -euo pipefail
+
+NEW_VERS=$1
+OLD_VERS=${2:-$(pyenv global | head -n1)}
+
+if [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PYTHON_CONFIGURE_OPTS="--enable-optimizations --with-lto=full" PYTHON_CFLAGS="-march=native -mtune=native" pyenv install -v -f "$NEW_VERS"
+else
+    pyenv install -v -f "$NEW_VERS"
+fi
+
+pyenv migrate "$OLD_VERS" "$NEW_VERS"
+
+mapfile -t globals < <(pyenv global)
+new_globals=()
+for v in "${globals[@]}"; do
+    if [[ $v == "$OLD_VERS" ]]; then
+        new_globals+=("$NEW_VERS")
+    else
+        new_globals+=("$v")
+    fi
+done
+pyenv global "${new_globals[@]}"
+
+echo "To remove the old version, run:"
+echo "pyenv uninstall $OLD_VERS"

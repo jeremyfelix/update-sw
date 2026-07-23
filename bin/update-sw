@@ -26,7 +26,9 @@ def create_parser():
     parser = argparse.ArgumentParser(description=description)
 
     parser.add_argument(
-        '-p', '--pip-only', action='store_true', help='only update pip packages'
+        'updaters',
+        nargs='*',
+        help='updaters to run, by name [default: platform default set]',
     )
     parser.add_argument(
         '-P',
@@ -40,16 +42,9 @@ def create_parser():
         help='skip running update command',
     )
     parser.add_argument(
-        '-S',
-        '--skip-system-updater',
+        '--list',
         action='store_true',
-        help='skip running system update ui',
-    )
-    parser.add_argument(
-        '-A',
-        '--skip-appstore-updater',
-        action='store_true',
-        help='skip running appstore ui',
+        help='list known updater names and exit',
     )
     parser.add_argument(
         '-v',
@@ -420,7 +415,7 @@ class PipUpdater(Updater):
 
 class PyenvUpdater(CommandBasedUpdater):
     def __init__(self):
-        self._latest: tuple[int, int, int] | None = None
+        self._upgrades: list[tuple[str, str]] = []
 
     @property
     def name(self) -> str:
@@ -455,7 +450,12 @@ class PyenvUpdater(CommandBasedUpdater):
 
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
-        return ('false',)
+        return ()
+
+    def outdated(self):
+        print(self.outdated_banner)
+        self._outdated()
+        print()
 
     def _parse_version(self, ver_str: str) -> tuple[int, int, int]:
         vers_re = r'\b(\d+)\.(\d+)\.(\d+)\b'
@@ -464,40 +464,77 @@ class PyenvUpdater(CommandBasedUpdater):
             raise ValueError(f'"{ver_str}" does not match expected format')
         return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
+    def _classify(self, name: str) -> tuple[str, tuple[int, int, int]] | None:
+        cpython_match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', name)
+        if cpython_match:
+            return 'cpython', (
+                int(cpython_match.group(1)),
+                int(cpython_match.group(2)),
+                int(cpython_match.group(3)),
+            )
+        pypy_match = re.fullmatch(r'pypy(\d+)(?:\.\d+)?-(\d+)\.(\d+)\.(\d+)', name)
+        if pypy_match:
+            return 'pypy' + pypy_match.group(1), (
+                int(pypy_match.group(2)),
+                int(pypy_match.group(3)),
+                int(pypy_match.group(4)),
+            )
+        return None
+
+    def _latest_by_flavor(
+        self, names: list[str]
+    ) -> dict[str, tuple[str, tuple[int, int, int]]]:
+        latest: dict[str, tuple[str, tuple[int, int, int]]] = {}
+        for name in names:
+            classified = self._classify(name.strip())
+            if classified is None:
+                continue
+            flavor, key = classified
+            if flavor not in latest or key > latest[flavor][1]:
+                latest[flavor] = (name.strip(), key)
+        return latest
+
     def _outdated(self):
-        current = subprocess.run(
-            ('pyenv', 'version-name'),
+        installed = subprocess.run(
+            ('pyenv', 'versions', '--bare', '--skip-aliases'),
             check=True,
             capture_output=True,
             encoding='utf8',
-        ).stdout.strip()
+        ).stdout.splitlines()
         available = subprocess.run(
             ('pyenv', 'install', '--list'),
             check=True,
             capture_output=True,
             encoding='utf8',
-        ).stdout
-        cur_ver = self._parse_version(current)
-        avail_vers = []
-        for avail in available.splitlines():
-            try:
-                avail_ver = self._parse_version(avail.strip())
-            except ValueError:
-                continue
-            if avail_ver > cur_ver:
-                avail_vers.append(avail_ver)
+        ).stdout.splitlines()
 
-        if avail_vers:
-            latest = sorted(avail_vers)[-1]
-            print('Current version:', '.'.join(map(str, cur_ver)))
-            print('Latest version:', '.'.join(map(str, latest)))
-            self._latest = latest
+        current = self._latest_by_flavor(installed)
+        latest = self._latest_by_flavor(available)
+
+        self._upgrades = []
+        for flavor, (old_name, old_key) in current.items():
+            if flavor not in latest:
+                continue
+            new_name, new_key = latest[flavor]
+            print(f'{flavor}: current {old_name}, latest {new_name}')
+            if new_key > old_key:
+                print(f'{flavor}: {old_name} -> {new_name}')
+                self._upgrades.append((old_name, new_name))
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        if not self._latest:
-            return ()
-        return ('update-python', '.'.join(map(str, self._latest)))
+        return ()
+
+    def upgrade(self):
+        if not self._upgrades:
+            return
+        for old, new in self._upgrades:
+            reply = input(
+                f'Run upgrade ({self.name}: {old} -> {new})? [Y/n]: '
+            )
+            if reply not in ('N', 'n'):
+                self._run(('update-python', new, old))
+        print()
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
@@ -577,54 +614,131 @@ class RustupUpdater(CommandBasedUpdater):
         )
 
 
-def update_sw(
-    skip_update: bool, skip_system_updater: bool, skip_appstore_updater: bool
-):
+class ExplorerUpdater(Updater):
+    """Base for Windows updaters that just open a settings pane via explorer.exe."""
+
+    uri: str
+
+    def _update(self):
+        subprocess.run(['explorer.exe', self.uri])
+
+    def _outdated(self):
+        pass
+
+    def _upgrade(self):
+        pass
+
+    def _cleanup(self):
+        pass
+
+    def outdated(self):
+        pass
+
+    def upgrade(self):
+        pass
+
+    def cleanup(self):
+        pass
+
+
+class WindowsUpdateUpdater(ExplorerUpdater):
+    uri = 'ms-settings:windowsupdate'
+
+    @property
+    def name(self) -> str:
+        return 'windows-update'
+
+
+class WindowsStoreUpdater(ExplorerUpdater):
+    uri = 'ms-windows-store:'
+
+    @property
+    def name(self) -> str:
+        return 'windows-store'
+
+
+def default_updaters() -> list[str]:
+    """Compute the ordered list of updater names to run by default on this platform."""
+
+    names: list[str]
     match platform.system():
         case 'Darwin':
-            if not skip_system_updater:
-                MacOsUpdater().run()
-            BrewUpdater().run(skip_update)
+            names = ['macos', 'brew', 'pip']
         case 'Linux':
             import distro  # type: ignore
 
             # If Linux, check if for ubuntu vs. gentoo.
             match distro.id():
                 case 'gentoo':
-                    if not skip_system_updater:
-                        EmergeUpdater().run(skip_update)
+                    names = ['emerge', 'pip']
                 case 'rasbian':
-                    AptUpdater().run(skip_update)
+                    names = ['apt', 'pip']
                 case 'ubuntu':
                     if 'microsoft-standard-WSL' in platform.uname().release:
-                        if not skip_system_updater:
-                            subprocess.run(
-                                ['explorer.exe', 'ms-settings:windowsupdate']
-                            )
-                        if not skip_appstore_updater:
-                            subprocess.run(
-                                ['explorer.exe', 'ms-windows-store:']
-                            )
-                    AptUpdater().run(skip_update)
+                        names = ['windows-update', 'windows-store', 'apt', 'pip']
+                    else:
+                        names = ['apt', 'pip']
+                case _:
+                    names = ['pip']
+        case _:
+            names = ['pip']
+
+    if PyenvUpdater.has_pyenv():
+        names.append('pyenv')
+    if RustupUpdater.has_rustup():
+        names.append('rustup')
+
+    return names
+
+
+def build_registry(args) -> dict:
+    """Build the name -> zero-arg Updater builder registry."""
+
+    return {
+        'brew': BrewUpdater,
+        'apt': AptUpdater,
+        'emerge': EmergeUpdater,
+        'macos': MacOsUpdater,
+        'windows-update': WindowsUpdateUpdater,
+        'windows-store': WindowsStoreUpdater,
+        'rustup': RustupUpdater,
+        'pyenv': PyenvUpdater,
+        'pip': lambda: PipUpdater(args.pip_bin),
+    }
 
 
 def main():
     args = parse_args()
     configure_logging(args)
 
-    try:
-        if not args.pip_only:
-            update_sw(
-                args.skip_update,
-                args.skip_system_updater,
-                args.skip_appstore_updater,
+    registry = build_registry(args)
+
+    if args.list:
+        defaults = set(default_updaters())
+        for updater_name in registry:
+            marker = '*' if updater_name in defaults else ' '
+            print(f'{marker} {updater_name}')
+        return 0
+
+    if args.updaters:
+        unknown = [n for n in args.updaters if n not in registry]
+        if unknown:
+            print(
+                f'Unknown updater(s): {", ".join(unknown)}',
+                file=sys.stderr,
             )
-        PipUpdater(args.pip_bin).run()
-        if not args.pip_only:
-            if PyenvUpdater.has_pyenv():
-                PyenvUpdater().run()
-            if RustupUpdater.has_rustup():
-                RustupUpdater().run()
+            print(
+                f'Valid updaters: {", ".join(registry)}',
+                file=sys.stderr,
+            )
+            return 2
+        selected = args.updaters
+    else:
+        selected = default_updaters()
+
+    try:
+        for updater_name in selected:
+            registry[updater_name]().run(skip_update=args.skip_update)
     except subprocess.CalledProcessError as ex:
         print(ex, file=sys.stderr)
         return ex.returncode
