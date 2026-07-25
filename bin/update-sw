@@ -996,6 +996,97 @@ class RustupUpdater(CommandBasedUpdater):
         )
 
 
+class CargoUpdater(CommandBasedUpdater):
+    """Updates the binaries installed with `cargo install`.
+
+    cargo can list what is installed but has no notion of what is stale, so
+    both halves of this are left to cargo-update, the subcommand that exists
+    for exactly that.
+    """
+
+    @staticmethod
+    def cargo_bin_dir() -> Path:
+        cargo_home = os.environ.get('CARGO_HOME')
+        root = Path(cargo_home) if cargo_home else Path.home() / '.cargo'
+        return root / 'bin'
+
+    @staticmethod
+    def has_cargo() -> bool:
+        return shutil.which('cargo') is not None
+
+    @classmethod
+    def has_cargo_update(cls) -> bool:
+        # Resolved the way cargo resolves its own subcommands: PATH first,
+        # then $CARGO_HOME/bin, which is not always on PATH.
+        if shutil.which('cargo-install-update') is not None:
+            return True
+        binary = cls.cargo_bin_dir() / 'cargo-install-update'
+        return os.access(binary, os.X_OK)
+
+    @classmethod
+    def missing_tool_hint(cls) -> str | None:
+        """Say what to install, or None if this updater can run."""
+
+        if not cls.has_cargo():
+            return 'cargo is not installed; nothing to update.'
+        if not cls.has_cargo_update():
+            return (
+                'cargo-update is not installed, so installed binaries '
+                'cannot be checked.\n'
+                'Install it with: cargo install cargo-update'
+            )
+        return None
+
+    @property
+    def name(self) -> str:
+        return 'cargo'
+
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        # `install-update --list` polls the registry itself.
+        return ()
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        # cargo-update leaves --git off by default because re-fetching every
+        # git package is slow, but without it those packages are never
+        # reported and so never updated -- the same trade brew makes here
+        # with --fetch-HEAD.
+        return ('cargo', 'install-update', '--list', '--all', '--git')
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        return ('cargo', 'install-update', '--all', '--git')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def has_updates(self) -> bool:
+        # Every package row ends in Yes or No, and the table header's last
+        # field is 'update', so matching the final field is enough.
+        return any(
+            fields[-1] == 'Yes'
+            for fields in (
+                line.split() for line in self.outdated_output.splitlines()
+            )
+            if fields
+        )
+
+    def outdated(self):
+        # Reached when the user asked for this updater by name; the default
+        # set leaves it out unless cargo-update is installed.
+        hint = self.missing_tool_hint()
+        if hint is not None:
+            print(self.outdated_banner)
+            print(hint)
+            print()
+            self.outdated_output = ''
+            return
+        super().outdated()
+
+
 class ExplorerUpdater(Updater):
     """Base for Windows updaters that just open a settings pane via explorer.exe."""
 
@@ -1073,6 +1164,10 @@ def default_updaters() -> list[str]:
             names.append('venv')
     if RustupUpdater.has_rustup():
         names.append('rustup')
+    # After rustup, so anything rebuilt from source uses the toolchain that
+    # was just updated. Only worth queueing if cargo-update can do the check.
+    if CargoUpdater.has_cargo_update():
+        names.append('cargo')
 
     return names
 
@@ -1088,6 +1183,7 @@ def build_registry(args) -> dict[str, Callable[[], Updater]]:
         'windows-update': WindowsUpdateUpdater,
         'windows-store': WindowsStoreUpdater,
         'rustup': RustupUpdater,
+        'cargo': CargoUpdater,
         'pyenv': PyenvUpdater,
         'venv': VenvUpdater,
         'pip': lambda: PipUpdater(args.pip_bin),
