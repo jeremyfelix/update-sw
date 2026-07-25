@@ -4,13 +4,15 @@ import argparse
 import getpass
 import json
 import logging
+import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import TextIO, cast
@@ -325,36 +327,78 @@ class EmergeUpdater(CommandBasedUpdater):
         return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av', '--depclean')
 
 
-def classify_version(name: str) -> tuple[str, tuple[int, int, int]] | None:
-    cpython_match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', name)
-    if cpython_match:
-        return 'cpython', (
-            int(cpython_match.group(1)),
-            int(cpython_match.group(2)),
-            int(cpython_match.group(3)),
-        )
-    pypy_match = re.fullmatch(r'pypy(\d+)(?:\.\d+)?-(\d+)\.(\d+)\.(\d+)', name)
-    if pypy_match:
-        return 'pypy' + pypy_match.group(1), (
-            int(pypy_match.group(2)),
-            int(pypy_match.group(3)),
-            int(pypy_match.group(4)),
-        )
+CPYTHON_RE = re.compile(r'(\d+)\.(\d+)\.(\d+)')
+PYPY_RE = re.compile(r'pypy(\d+)(?:\.(\d+))?-(\d+)\.(\d+)\.(\d+)')
+
+
+@dataclass(frozen=True)
+class PyVersion:
+    """A pyenv version name split into its implementation and series."""
+
+    name: str
+    impl: str  # 'cpython', 'pypy2', 'pypy3', ...
+    series: tuple[int, int]  # the (major, minor) Python series, e.g. (3, 13)
+    release: tuple[int, ...]  # sorts releases *within* a series
+
+    @property
+    def series_name(self) -> str:
+        return f'{self.impl} {self.series[0]}.{self.series[1]}'
+
+
+SeriesKey = tuple[str, tuple[int, int]]
+
+
+def classify_version(name: str) -> PyVersion | None:
+    """Parse a pyenv version name.
+
+    Returns None for anything that is not a plain CPython or PyPy release, so
+    aliases, pre-releases (3.14.0rc1), free-threaded builds (3.14.0t), -dev
+    branches and anaconda/jython/graalpy entries are all ignored.
+    """
+
+    name = name.strip()
+
+    cpython = CPYTHON_RE.fullmatch(name)
+    if cpython:
+        major, minor, patch = (int(group) for group in cpython.groups())
+        return PyVersion(name, 'cpython', (major, minor), (patch,))
+
+    pypy = PYPY_RE.fullmatch(name)
+    if pypy:
+        major = int(pypy.group(1))
+        minor = int(pypy.group(2) or 0)
+        # PyPy releases are ordered by their own version, not the Python one.
+        release = tuple(int(group) for group in pypy.groups()[2:])
+        return PyVersion(name, f'pypy{major}', (major, minor), release)
+
     return None
 
 
-def latest_per_flavor(
-    names: list[str],
-) -> dict[str, tuple[str, tuple[int, int, int]]]:
-    latest: dict[str, tuple[str, tuple[int, int, int]]] = {}
+def latest_per_series(names: list[str]) -> dict[SeriesKey, PyVersion]:
+    """Map each (implementation, series) to its newest release in `names`."""
+
+    latest: dict[SeriesKey, PyVersion] = {}
     for name in names:
-        classified = classify_version(name.strip())
-        if classified is None:
+        version = classify_version(name)
+        if version is None:
             continue
-        flavor, key = classified
-        if flavor not in latest or key > latest[flavor][1]:
-            latest[flavor] = (name.strip(), key)
+        key = (version.impl, version.series)
+        if key not in latest or version.release > latest[key].release:
+            latest[key] = version
     return latest
+
+
+def newest_series_per_impl(
+    by_series: dict[SeriesKey, PyVersion],
+) -> dict[str, PyVersion]:
+    """Map each implementation to its newest *series*, not newest release."""
+
+    newest: dict[str, PyVersion] = {}
+    for version in by_series.values():
+        current = newest.get(version.impl)
+        if current is None or version.series > current.series:
+            newest[version.impl] = version
+    return newest
 
 
 def _pyenv_lines(args: tuple[str, ...]) -> list[str]:
@@ -363,21 +407,30 @@ def _pyenv_lines(args: tuple[str, ...]) -> list[str]:
     ).stdout.splitlines()
 
 
-def pyenv_latest_versions() -> list[str]:
-    """Return the newest installed pyenv version name for each flavor."""
-    latest = latest_per_flavor(
-        _pyenv_lines(('pyenv', 'versions', '--bare', '--skip-aliases'))
+def pyenv_installed_versions() -> list[str]:
+    """Every installed version, plus virtualenvs as `<version>/envs/<name>`."""
+
+    return sorted(
+        filter(
+            None,
+            (
+                line.strip()
+                for line in _pyenv_lines(
+                    ('pyenv', 'versions', '--bare', '--skip-aliases')
+                )
+            ),
+        )
     )
-    return [name for (name, key) in latest.values()]
 
 
 class SinglePipUpdater(Updater):
     PIP_SKIP = ('inventory', 'utils')
 
     def __init__(self, pip_path: str | Path, label: str | None = None):
-        self.pip = shutil.which(pip_path)
-        if self.pip is None:
-            raise ValueError(pip_path)
+        resolved = shutil.which(pip_path)
+        if resolved is None:
+            raise FileNotFoundError(f'no executable pip at {pip_path}')
+        self.pip: str = resolved
         self._label = label
         self._to_update: list[str] = []
 
@@ -386,7 +439,7 @@ class SinglePipUpdater(Updater):
         return f'pip ({self._label})' if self._label else 'pip'
 
     def run(self, skip_update: bool = False):
-        owner = Path(cast(str | Path, self.pip)).owner()
+        owner = Path(self.pip).owner()
         us = getpass.getuser()
         if owner != us:
             print(f'Skipping python (owner: {owner}) that is not ours ({us})')
@@ -460,9 +513,20 @@ class SinglePipUpdater(Updater):
             subprocess.run([self.pip, 'install'] + to_fix, check=True)
 
 
+@dataclass(frozen=True)
+class PyenvUpgrade:
+    """A single pyenv upgrade to offer the user."""
+
+    old: str
+    new: str
+    # A new series is an *additional* install: `old` only supplies the packages
+    # to migrate across and stays installed afterwards.
+    new_series: bool = False
+
+
 class PyenvUpdater(CommandBasedUpdater):
     def __init__(self):
-        self._upgrades: list[tuple[str, str]] = []
+        self._upgrades: list[PyenvUpgrade] = []
 
     @property
     def name(self) -> str:
@@ -500,20 +564,17 @@ class PyenvUpdater(CommandBasedUpdater):
         return ()
 
     def outdated(self):
+        # Bypasses CommandBasedUpdater.outdated(), which would skip the check
+        # entirely because there is no single `outdated_cmd` to run for it.
         print(self.outdated_banner)
         self._outdated()
         print()
 
-    def _parse_version(self, ver_str: str) -> tuple[int, int, int]:
-        vers_re = r'\b(\d+)\.(\d+)\.(\d+)\b'
-        match = re.match(vers_re, ver_str)
-        if not match:
-            raise ValueError(f'"{ver_str}" does not match expected format')
-        return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
     def _venvs_on(self, base: str) -> list[str]:
         try:
-            lines = _pyenv_lines(('pyenv', 'virtualenvs', '--bare', '--skip-aliases'))
+            lines = _pyenv_lines(
+                ('pyenv', 'virtualenvs', '--bare', '--skip-aliases')
+            )
         except (FileNotFoundError, subprocess.CalledProcessError):
             return []
         prefix = f'{base}/envs/'
@@ -523,22 +584,73 @@ class PyenvUpdater(CommandBasedUpdater):
             if line.strip().startswith(prefix)
         ]
 
-    def _outdated(self):
-        installed = _pyenv_lines(('pyenv', 'versions', '--bare', '--skip-aliases'))
-        available = _pyenv_lines(('pyenv', 'install', '--list'))
+    @staticmethod
+    def _global_version() -> str | None:
+        """The first real version in `pyenv global`, if there is one."""
 
-        current = latest_per_flavor(installed)
-        latest = latest_per_flavor(available)
+        try:
+            lines = _pyenv_lines(('pyenv', 'global'))
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
+        for line in lines:
+            name = line.strip()
+            if name and name != 'system':
+                return name
+        return None
+
+    def _migration_source(self, impl: str, newest_installed: PyVersion) -> str:
+        """Which version a new-series install should inherit its packages from.
+
+        The current `pyenv global` when it belongs to the same implementation,
+        otherwise that implementation's newest installed version -- migrating
+        CPython's packages into a PyPy build would not help anyone.
+        """
+
+        name = self._global_version()
+        if name is not None:
+            parsed = classify_version(name)
+            if parsed is not None and parsed.impl == impl:
+                return name
+        return newest_installed.name
+
+    def _outdated(self):
+        installed = latest_per_series(pyenv_installed_versions())
+        available = latest_per_series(
+            _pyenv_lines(('pyenv', 'install', '--list'))
+        )
 
         self._upgrades = []
-        for flavor, (old_name, old_key) in current.items():
-            if flavor not in latest:
+
+        # Keep every installed series on the newest release of that series, so
+        # a 3.12 stays a 3.12 rather than being dragged onto 3.13.
+        for key, current in sorted(installed.items()):
+            newest = available.get(key)
+            if newest is None:
                 continue
-            new_name, new_key = latest[flavor]
-            print(f'{flavor}: current {old_name}, latest {new_name}')
-            if new_key > old_key:
-                print(f'{flavor}: {old_name} -> {new_name}')
-                self._upgrades.append((old_name, new_name))
+            if newest.release > current.release:
+                print(
+                    f'{current.series_name}: '
+                    f'{current.name} -> {newest.name}'
+                )
+                self._upgrades.append(PyenvUpgrade(current.name, newest.name))
+            else:
+                print(f'{current.series_name}: {current.name} (up to date)')
+
+        # Separately, offer to *add* a newer series than anything installed.
+        newest_installed = newest_series_per_impl(installed)
+        for impl, newest in sorted(newest_series_per_impl(available).items()):
+            current = newest_installed.get(impl)
+            # Only offer series for implementations already in use.
+            if current is None or newest.series <= current.series:
+                continue
+            source = self._migration_source(impl, current)
+            print(
+                f'{impl}: new series {newest.series_name} available '
+                f'({newest.name}, migrating from {source})'
+            )
+            self._upgrades.append(
+                PyenvUpgrade(source, newest.name, new_series=True)
+            )
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
@@ -547,24 +659,47 @@ class PyenvUpdater(CommandBasedUpdater):
     def upgrade(self):
         if not self._upgrades:
             return
-        for old, new in self._upgrades:
-            reply = input(
-                f'Run upgrade ({self.name}: {old} -> {new})? [Y/n]: '
-            )
-            if reply not in ('N', 'n'):
-                venvs = self._venvs_on(old)
+
+        first_error: subprocess.CalledProcessError | None = None
+        for upgrade in self._upgrades:
+            if upgrade.new_series:
+                prompt = (
+                    f'Install new series ({self.name}: {upgrade.new}), '
+                    f'migrating from {upgrade.old}? [Y/n]: '
+                )
+            else:
+                prompt = (
+                    f'Run upgrade ({self.name}: '
+                    f'{upgrade.old} -> {upgrade.new})? [Y/n]: '
+                )
+            if input(prompt) in ('N', 'n'):
+                continue
+
+            cmd = ['update-python']
+            # Only a within-series upgrade retires the old version, so only
+            # then is it safe to move its virtualenvs across; a new series
+            # leaves the old one installed and still in use.
+            if not upgrade.new_series:
+                venvs = self._venvs_on(upgrade.old)
                 if venvs:
                     venv_reply = input(
-                        f'Migrate {len(venvs)} virtualenv(s) on {old} '
-                        f'({", ".join(venvs)}) to {new}? [Y/n]: '
+                        f'Migrate {len(venvs)} virtualenv(s) on {upgrade.old} '
+                        f'({", ".join(venvs)}) to {upgrade.new}? [Y/n]: '
                     )
                     if venv_reply not in ('N', 'n'):
-                        self._run(('update-python', '--migrate-venvs', new, old))
-                    else:
-                        self._run(('update-python', new, old))
-                else:
-                    self._run(('update-python', new, old))
+                        cmd.append('--migrate-venvs')
+            cmd += [upgrade.new, upgrade.old]
+
+            # One failed version should not cost the user the others.
+            try:
+                self._run(tuple(cmd))
+            except subprocess.CalledProcessError as ex:
+                print(f'{upgrade.new}: {ex}', file=sys.stderr)
+                first_error = first_error or ex
         print()
+
+        if first_error is not None:
+            raise first_error
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
@@ -572,8 +707,7 @@ class PyenvUpdater(CommandBasedUpdater):
 
 
 class PipUpdater(Updater):
-    # Pyenv virtualenv names to also keep updated (opt-in; not auto-discovered).
-    PIP_VENVS: tuple[str, ...] = ()
+    """Runs the pip updater against every pyenv environment we own."""
 
     def __init__(self, pip_bin: str | None = None):
         self.pip_bin = pip_bin
@@ -593,18 +727,15 @@ class PipUpdater(Updater):
                 capture_output=True,
                 encoding='utf8',
             ).stdout.strip()
-            candidates = [
-                (version, f'{root}/versions/{version}/bin/pip')
-                for version in pyenv_latest_versions()
-            ] + [
-                (venv, f'{root}/versions/{venv}/bin/pip')
-                for venv in self.PIP_VENVS
-            ]
-            return [
-                (path, label)
-                for (label, path) in candidates
-                if Path(path).exists()
-            ]
+            # Every installed version and virtualenv, not just the newest of
+            # each series: whichever one is active still wants its packages
+            # kept current. SinglePipUpdater skips any we do not own.
+            targets = []
+            for version in pyenv_installed_versions():
+                path = f'{root}/versions/{version}/bin/pip'
+                if os.access(path, os.X_OK):
+                    targets.append((path, version))
+            return targets
 
         return [('pip3', None)]
 
@@ -613,8 +744,27 @@ class PipUpdater(Updater):
         if not targets:
             print('No pip targets found')
             return
+
+        failed = False
+        first_error: subprocess.CalledProcessError | None = None
         for path, label in targets:
-            SinglePipUpdater(path, label).run(skip_update)
+            # Keep going: one broken environment -- a pip too old to speak
+            # `--format json`, a half-removed prefix -- should not cost the
+            # user every other environment queued behind it.
+            try:
+                SinglePipUpdater(path, label).run(skip_update)
+            except subprocess.CalledProcessError as ex:
+                print(f'{label or path}: {ex}', file=sys.stderr)
+                first_error = first_error or ex
+                failed = True
+            except (json.JSONDecodeError, OSError) as ex:
+                print(f'{label or path}: {ex}', file=sys.stderr)
+                failed = True
+
+        if first_error is not None:
+            raise first_error
+        if failed:
+            raise subprocess.CalledProcessError(1, ('pip',))
 
     def _update(self):
         pass
@@ -779,7 +929,7 @@ def default_updaters() -> list[str]:
     return names
 
 
-def build_registry(args) -> dict:
+def build_registry(args) -> dict[str, Callable[[], Updater]]:
     """Build the name -> zero-arg Updater builder registry."""
 
     return {
@@ -806,6 +956,7 @@ def main():
         for updater_name in registry:
             marker = '*' if updater_name in defaults else ' '
             print(f'{marker} {updater_name}')
+        print('\n* runs by default on this platform')
         return 0
 
     if args.updaters:
@@ -824,12 +975,26 @@ def main():
     else:
         selected = default_updaters()
 
-    try:
-        for updater_name in selected:
+    # A failing updater should not cost the user every updater queued behind
+    # it; report at the end and exit non-zero instead.
+    failures: list[tuple[str, int]] = []
+    for updater_name in selected:
+        try:
             registry[updater_name]().run(skip_update=args.skip_update)
-    except subprocess.CalledProcessError as ex:
-        print(ex, file=sys.stderr)
-        return ex.returncode
+        except subprocess.CalledProcessError as ex:
+            print(f'{updater_name}: {ex}', file=sys.stderr)
+            failures.append((updater_name, ex.returncode or 1))
+        except OSError as ex:
+            print(f'{updater_name}: {ex}', file=sys.stderr)
+            failures.append((updater_name, 1))
+
+    if failures:
+        print(
+            'Failed updaters: '
+            + ', '.join(name for name, _ in failures),
+            file=sys.stderr,
+        )
+        return failures[0][1]
 
     return 0
 
