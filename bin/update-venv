@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+#
+# Move pyenv virtualenvs onto a newer base Python, preserving their packages.
+#
+# This is the rollback-safe primitive: `update-python --migrate-venvs` and
+# update-sw's `venv` updater both drive it rather than reimplementing the move.
+#
+# Deliberately kept compatible with bash 3.2, the /bin/bash that ships with
+# macOS: no mapfile/readarray, no associative arrays, and no unguarded
+# "${arr[@]}" on a possibly-empty array under `set -u`.
+#
+# `set -e` is *not* used: one virtualenv has to be able to fail without
+# abandoning the rest, so errors are handled explicitly.
+
+set -uo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: update-venv [--to VERSION] [--all] [--list] [NAME...]
+
+Moves pyenv virtualenvs onto a newer base Python, keeping their packages.
+
+With no --to, each virtualenv moves to the newest *installed* release in its
+own series (3.12.7 -> 3.12.11). Pass --to to send it anywhere else, including
+onto a newer series (--to 3.13.5).
+
+  --to VERSION  base version to move onto
+  --all         update every virtualenv that is behind
+  --list        show each virtualenv's base and where it would move (default
+                when no names are given)
+EOF
+}
+
+TARGET=
+LIST=
+ALL=
+NAMES=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --to)
+            if [ $# -lt 2 ]; then
+                echo "error: --to requires a version" >&2
+                exit 2
+            fi
+            TARGET=$2
+            shift 2
+            ;;
+        --to=*) TARGET=${1#--to=}; shift ;;
+        --all) ALL=1; shift ;;
+        --list) LIST=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*)
+            echo "error: unknown option: $1" >&2
+            usage
+            exit 2
+            ;;
+        *) NAMES[${#NAMES[@]}]=$1; shift ;;
+    esac
+done
+
+if [ ${#NAMES[@]} -eq 0 ] && [ -z "$ALL" ]; then
+    LIST=1
+fi
+if [ ${#NAMES[@]} -gt 0 ] && [ -n "$ALL" ]; then
+    echo "error: pass names or --all, not both" >&2
+    exit 2
+fi
+
+ROOT=$(pyenv root) || exit $?
+
+if ! pyenv commands 2>/dev/null | grep -qx virtualenvs; then
+    echo "error: pyenv-virtualenv is not installed" >&2
+    exit 1
+fi
+
+# --- version helpers --------------------------------------------------------
+
+# Echo the X.Y series of a plain CPython release, or fail for anything else
+# (pypy, anaconda, ...), which we will not guess a target for.
+series_of() {
+    local version=$1 rest
+    case $version in *[!0-9.]*) return 1 ;; esac
+    rest=${version#*.}
+    case $rest in *.*) ;; *) return 1 ;; esac
+    case ${rest#*.} in *.*) return 1 ;; esac
+    echo "${version%.*}"
+}
+
+# True when series $1 is newer than series $2.
+series_newer() {
+    local a_major=${1%%.*} a_minor=${1#*.}
+    local b_major=${2%%.*} b_minor=${2#*.}
+    if [ "$a_major" -ne "$b_major" ]; then
+        [ "$a_major" -gt "$b_major" ]
+        return $?
+    fi
+    [ "$a_minor" -gt "$b_minor" ]
+}
+
+# --- inventory --------------------------------------------------------------
+
+# Installed base versions: everything `pyenv versions` knows that is not
+# itself a virtualenv.
+installed=()
+while IFS= read -r version; do
+    case $version in */envs/*) continue ;; esac
+    [ -n "$version" ] || continue
+    installed[${#installed[@]}]=$version
+done < <(pyenv versions --bare --skip-aliases 2>/dev/null)
+
+# Virtualenvs, as parallel name/base arrays (bash 3.2 has no hashes).
+venv_names=()
+venv_bases=()
+while IFS= read -r line; do
+    case $line in */envs/*) ;; *) continue ;; esac
+    base=${line%%/envs/*}
+    name=${line#*/envs/}
+    [ -n "$base" ] && [ -n "$name" ] || continue
+    venv_names[${#venv_names[@]}]=$name
+    venv_bases[${#venv_bases[@]}]=$base
+done < <(pyenv virtualenvs --bare --skip-aliases 2>/dev/null)
+
+base_of() {
+    local wanted=$1 i=0
+    while [ $i -lt ${#venv_names[@]} ]; do
+        if [ "${venv_names[$i]}" = "$wanted" ]; then
+            echo "${venv_bases[$i]}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Newest installed release within a given series.
+newest_in_series() {
+    local wanted=$1 best= best_patch=-1 version series patch
+    for version in ${installed[@]+"${installed[@]}"}; do
+        series=$(series_of "$version") || continue
+        [ "$series" = "$wanted" ] || continue
+        patch=${version##*.}
+        if [ "$patch" -gt "$best_patch" ]; then
+            best=$version
+            best_patch=$patch
+        fi
+    done
+    [ -n "$best" ] || return 1
+    echo "$best"
+}
+
+# Newest installed release overall, across series.
+newest_installed() {
+    local best= best_series= version series
+    for version in ${installed[@]+"${installed[@]}"}; do
+        series=$(series_of "$version") || continue
+        if [ -z "$best" ] || series_newer "$series" "$best_series"; then
+            best=$version
+            best_series=$series
+        elif [ "$series" = "$best_series" ] &&
+             [ "${version##*.}" -gt "${best##*.}" ]; then
+            best=$version
+        fi
+    done
+    [ -n "$best" ] || return 1
+    echo "$best"
+}
+
+# Where a virtualenv on $1 would move with no explicit --to: the newest
+# release of its own series.
+default_target_for() {
+    local base=$1 series newest
+    series=$(series_of "$base") || return 1
+    newest=$(newest_in_series "$series") || return 1
+    [ "$newest" != "$base" ] || return 1
+    echo "$newest"
+}
+
+# --- migration --------------------------------------------------------------
+
+BACKUP_DIR=
+ensure_backup_dir() {
+    [ -z "$BACKUP_DIR" ] || return 0
+    BACKUP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-venv/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+}
+
+rollback_venv() {
+    local alias_link=$1 stashed_alias=$2
+    # Only ever removes a symlink: a real directory here would fail `rm -f`.
+    rm -f "$alias_link"
+    if [ -L "$stashed_alias" ]; then
+        mv "$stashed_alias" "$alias_link"
+    fi
+}
+
+# Recreate one virtualenv on a new base, rolling back to the original on any
+# failure. The frozen requirements are written to disk before anything is
+# touched, the replacement is built at its final name (so its shebangs are
+# right), and the original is only removed once the replacement exists and its
+# packages are installed.
+migrate_venv() {
+    local venv_name=$1 old_vers=$2 new_vers=$3
+    local old_prefix="$ROOT/versions/$old_vers/envs/$venv_name"
+    local new_prefix="$ROOT/versions/$new_vers/envs/$venv_name"
+    local alias_link="$ROOT/versions/$venv_name"
+    local stashed_alias="$alias_link.update-venv-bak"
+    local reqs
+
+    if [ ! -d "$ROOT/versions/$new_vers" ]; then
+        echo "  error: $new_vers is not installed" >&2
+        return 1
+    fi
+    if [ -e "$new_prefix" ]; then
+        echo "  skipping: $venv_name already exists on $new_vers" >&2
+        return 1
+    fi
+    if [ ! -x "$old_prefix/bin/pip" ]; then
+        echo "  skipping: no pip in $old_prefix" >&2
+        return 1
+    fi
+
+    ensure_backup_dir || return 1
+    reqs="$BACKUP_DIR/$venv_name.txt"
+    if ! "$old_prefix/bin/pip" freeze >"$reqs"; then
+        echo "  error: could not freeze $venv_name; leaving it untouched" >&2
+        return 1
+    fi
+    echo "  saved requirements to $reqs"
+
+    # The replacement cannot be created while the top-level alias symlink still
+    # points at the original, so move it aside rather than deleting it. This is
+    # the only mutation made before the new environment is known to be good.
+    if [ -L "$alias_link" ]; then
+        if ! mv "$alias_link" "$stashed_alias"; then
+            echo "  error: could not move $alias_link aside" >&2
+            return 1
+        fi
+    elif [ -e "$alias_link" ]; then
+        echo "  skipping: $alias_link exists and is not a symlink" >&2
+        return 1
+    fi
+
+    if ! pyenv virtualenv "$new_vers" "$venv_name"; then
+        echo "  error: could not create $venv_name on $new_vers" >&2
+        rollback_venv "$alias_link" "$stashed_alias"
+        echo "  the original virtualenv on $old_vers is intact" >&2
+        return 1
+    fi
+
+    if ! "$new_prefix/bin/pip" install -r "$reqs"; then
+        echo "  error: could not install $venv_name's packages on $new_vers" >&2
+        pyenv uninstall -f "$new_vers/envs/$venv_name" >/dev/null 2>&1
+        rollback_venv "$alias_link" "$stashed_alias"
+        echo "  the original virtualenv on $old_vers is intact" >&2
+        echo "  requirements kept at $reqs" >&2
+        return 1
+    fi
+
+    # The replacement is good; retire the original and the stashed alias.
+    rm -f "$stashed_alias"
+    pyenv uninstall -f "$old_vers/envs/$venv_name" || return 1
+    # pyenv-virtualenv's uninstall hook may take the alias with it; make sure
+    # it still resolves to the new environment.
+    if [ ! -e "$alias_link" ]; then
+        ln -s "$new_prefix" "$alias_link"
+    fi
+    return 0
+}
+
+# --- listing ----------------------------------------------------------------
+
+if [ -n "$LIST" ]; then
+    if [ ${#venv_names[@]} -eq 0 ]; then
+        echo "No pyenv virtualenvs found."
+        exit 0
+    fi
+    newest=$(newest_installed) || newest=
+    i=0
+    while [ $i -lt ${#venv_names[@]} ]; do
+        name=${venv_names[$i]}
+        base=${venv_bases[$i]}
+        i=$((i + 1))
+        if target=$(default_target_for "$base"); then
+            printf '%-24s %-12s -> %s\n' "$name" "$base" "$target"
+        elif base_series=$(series_of "$base") &&
+             [ -n "$newest" ] &&
+             newest_series=$(series_of "$newest") &&
+             series_newer "$newest_series" "$base_series"; then
+            printf '%-24s %-12s up to date in series (--to %s to move series)\n' \
+                "$name" "$base" "$newest"
+        else
+            printf '%-24s %-12s up to date\n' "$name" "$base"
+        fi
+    done
+    exit 0
+fi
+
+# --- work out what to move --------------------------------------------------
+
+move_names=()
+move_targets=()
+
+if [ -n "$ALL" ]; then
+    i=0
+    while [ $i -lt ${#venv_names[@]} ]; do
+        name=${venv_names[$i]}
+        base=${venv_bases[$i]}
+        i=$((i + 1))
+        if [ -n "$TARGET" ]; then
+            [ "$base" != "$TARGET" ] || continue
+            target=$TARGET
+        else
+            target=$(default_target_for "$base") || continue
+        fi
+        move_names[${#move_names[@]}]=$name
+        move_targets[${#move_targets[@]}]=$target
+    done
+    if [ ${#move_names[@]} -eq 0 ]; then
+        echo "Every virtualenv is already on the newest release of its series."
+        exit 0
+    fi
+else
+    for name in ${NAMES[@]+"${NAMES[@]}"}; do
+        if ! base=$(base_of "$name"); then
+            echo "error: no such virtualenv: $name" >&2
+            exit 2
+        fi
+        if [ -n "$TARGET" ]; then
+            target=$TARGET
+        elif ! target=$(default_target_for "$base"); then
+            echo "$name is on $base, already the newest installed release of its series."
+            if newest=$(newest_installed) && [ "$newest" != "$base" ]; then
+                echo "Pass --to $newest to move it onto a newer series."
+            fi
+            continue
+        fi
+        move_names[${#move_names[@]}]=$name
+        move_targets[${#move_targets[@]}]=$target
+    done
+    if [ ${#move_names[@]} -eq 0 ]; then
+        exit 0
+    fi
+fi
+
+# --- move -------------------------------------------------------------------
+
+failures=0
+migrated=0
+i=0
+while [ $i -lt ${#move_names[@]} ]; do
+    name=${move_names[$i]}
+    target=${move_targets[$i]}
+    i=$((i + 1))
+
+    base=$(base_of "$name") || continue
+    if [ "$base" = "$target" ]; then
+        echo "$name is already on $target"
+        continue
+    fi
+
+    echo "Moving virtualenv $name: $base -> $target"
+    if migrate_venv "$name" "$base" "$target"; then
+        migrated=$((migrated + 1))
+        echo "  moved $name -> $target"
+    else
+        failures=$((failures + 1))
+    fi
+done
+
+echo "Moved $migrated virtualenv(s), $failures failed."
+if [ "$failures" -gt 0 ] && [ -n "$BACKUP_DIR" ]; then
+    echo "Frozen requirements are under $BACKUP_DIR" >&2
+fi
+
+[ "$failures" -eq 0 ] || exit 1

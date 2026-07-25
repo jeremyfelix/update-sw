@@ -92,6 +92,11 @@ def configure_logging(args, use_stdout=False):
 
 
 class Updater(ABC):
+    @staticmethod
+    def _run(args: Sequence[str]):
+        logging.debug(args)
+        subprocess.run(args, check=True)
+
     @property
     def name(self) -> str:
         raise NotImplementedError
@@ -178,11 +183,6 @@ class CommandBasedUpdater(Updater):
             if returncode != 0 and returncode not in allowed_returncodes:
                 raise subprocess.CalledProcessError(p.returncode, args, output)
             return output
-
-    @staticmethod
-    def _run(args: Sequence[str]):
-        logging.debug(args)
-        subprocess.run(args, check=True)
 
     @property
     @abstractmethod
@@ -706,6 +706,150 @@ class PyenvUpdater(CommandBasedUpdater):
         return ()
 
 
+@dataclass(frozen=True)
+class VenvMove:
+    """A virtualenv that could be moved onto a newer base Python."""
+
+    name: str
+    base: str
+    in_series: str | None  # newest installed release of the base's own series
+    newer_series: str | None  # newest installed release of a later series
+
+
+class VenvUpdater(Updater):
+    """Moves pyenv virtualenvs that got left behind on an older base Python.
+
+    PyenvUpdater only migrates virtualenvs as a side effect of upgrading the
+    version they sit on, so one that was skipped -- or whose base was never
+    upgraded -- stays behind indefinitely. This finds those.
+    """
+
+    def __init__(self):
+        self._moves: list[VenvMove] = []
+
+    @property
+    def name(self) -> str:
+        return 'venv'
+
+    @staticmethod
+    def has_virtualenv() -> bool:
+        try:
+            commands = _pyenv_lines(('pyenv', 'commands'))
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+            return False
+        return 'virtualenvs' in (command.strip() for command in commands)
+
+    def _update(self):
+        pass
+
+    def _upgrade(self):
+        pass
+
+    def _cleanup(self):
+        pass
+
+    def update(self):
+        pass
+
+    def cleanup(self):
+        pass
+
+    def _outdated(self):
+        installed = latest_per_series(
+            [
+                version
+                for version in pyenv_installed_versions()
+                if '/envs/' not in version
+            ]
+        )
+        newest_by_impl = newest_series_per_impl(installed)
+
+        self._moves = []
+        for line in _pyenv_lines(
+            ('pyenv', 'virtualenvs', '--bare', '--skip-aliases')
+        ):
+            line = line.strip()
+            base, sep, name = line.partition('/envs/')
+            if not sep or not name:
+                continue
+            parsed = classify_version(base)
+            if parsed is None:
+                continue
+
+            in_series = installed.get((parsed.impl, parsed.series))
+            newer_series = newest_by_impl.get(parsed.impl)
+            move = VenvMove(
+                name,
+                base,
+                in_series.name
+                if in_series is not None and in_series.release > parsed.release
+                else None,
+                newer_series.name
+                if newer_series is not None
+                and newer_series.series > parsed.series
+                else None,
+            )
+            if move.in_series or move.newer_series:
+                print(f'{name}: on {base}')
+                self._moves.append(move)
+
+    def upgrade(self):
+        if not self._moves:
+            return
+
+        first_error: subprocess.CalledProcessError | None = None
+        for move in self._moves:
+            target = self._choose_target(move)
+            if target is None:
+                continue
+            # One failed virtualenv should not cost the user the others.
+            try:
+                self._run(('update-venv', '--to', target, move.name))
+            except subprocess.CalledProcessError as ex:
+                print(f'{move.name}: {ex}', file=sys.stderr)
+                first_error = first_error or ex
+        print()
+
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _choose_target(move: VenvMove) -> str | None:
+        """Ask where to move a virtualenv, or None to leave it alone."""
+
+        options = [
+            (target, label)
+            for target, label in (
+                (move.in_series, 'same series'),
+                (move.newer_series, 'newest installed'),
+            )
+            if target is not None
+        ]
+        if len(options) == 1:
+            target, label = options[0]
+            reply = input(
+                f'Move {move.name} from {move.base} to {target} '
+                f'({label})? [Y/n]: '
+            )
+            return None if reply in ('N', 'n') else target
+
+        print(f'{move.name} is on {move.base}:')
+        for number, (target, label) in enumerate(options, start=1):
+            print(f'  {number}) {target} ({label})')
+        choices = '/'.join(
+            str(number) for number in range(1, len(options) + 1)
+        )
+        reply = input(f'Move {move.name}? [{choices}/n]: ').strip()
+        if reply in ('N', 'n'):
+            return None
+        if not reply:
+            return options[0][0]
+        if reply.isdigit() and 1 <= int(reply) <= len(options):
+            return options[int(reply) - 1][0]
+        print(f'Skipping {move.name}: "{reply}" is not one of {choices}')
+        return None
+
+
 class PipUpdater(Updater):
     """Runs the pip updater against every pyenv environment we own."""
 
@@ -923,6 +1067,10 @@ def default_updaters() -> list[str]:
 
     if PyenvUpdater.has_pyenv():
         names.append('pyenv')
+        # After pyenv, so a virtualenv whose base was just upgraded is already
+        # dealt with and only genuine stragglers are left to report.
+        if VenvUpdater.has_virtualenv():
+            names.append('venv')
     if RustupUpdater.has_rustup():
         names.append('rustup')
 
@@ -941,6 +1089,7 @@ def build_registry(args) -> dict[str, Callable[[], Updater]]:
         'windows-store': WindowsStoreUpdater,
         'rustup': RustupUpdater,
         'pyenv': PyenvUpdater,
+        'venv': VenvUpdater,
         'pip': lambda: PipUpdater(args.pip_bin),
     }
 
@@ -1003,4 +1152,9 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        sys.exit(1)
+    except EOFError:
+        # Nothing on stdin to answer a prompt with: bail out rather than
+        # tracebacking out of a non-interactive run.
+        print('No input available for prompt; stopping.', file=sys.stderr)
         sys.exit(1)

@@ -129,91 +129,13 @@ fi
 
 # --- migrate virtualenvs ----------------------------------------------------
 
-rollback_venv() {
-    alias_link=$1
-    stashed_alias=$2
-    # Only ever removes a symlink: a real directory here would fail `rm -f`.
-    rm -f "$alias_link"
-    if [ -L "$stashed_alias" ]; then
-        mv "$stashed_alias" "$alias_link"
-    fi
-}
-
-# Recreate a single virtualenv on $NEW_VERS, rolling back to the original on
-# any failure. The original prefix is only removed once the replacement exists
-# and its packages are installed, and the frozen requirements are written to
-# disk before anything is touched, so a failure is always recoverable.
-migrate_venv() {
-    local venv_name=$1
-    local old_prefix="$ROOT/versions/$OLD_VERS/envs/$venv_name"
-    local new_prefix="$ROOT/versions/$NEW_VERS/envs/$venv_name"
-    local alias_link="$ROOT/versions/$venv_name"
-    local stashed_alias="$alias_link.update-python-bak"
-    local reqs="$BACKUP_DIR/$venv_name.txt"
-
-    if [ -e "$new_prefix" ]; then
-        echo "  skipping: $venv_name already exists on $NEW_VERS" >&2
-        return 1
-    fi
-    if [ ! -x "$old_prefix/bin/pip" ]; then
-        echo "  skipping: no pip in $old_prefix" >&2
-        return 1
-    fi
-
-    if ! "$old_prefix/bin/pip" freeze >"$reqs"; then
-        echo "  error: could not freeze $venv_name; leaving it untouched" >&2
-        return 1
-    fi
-    echo "  saved requirements to $reqs"
-
-    # The replacement cannot be created while the top-level alias symlink still
-    # points at the original, so move it aside rather than deleting it. This is
-    # the only mutation made before the new environment is known to be good.
-    if [ -L "$alias_link" ]; then
-        if ! mv "$alias_link" "$stashed_alias"; then
-            echo "  error: could not move $alias_link aside" >&2
-            return 1
-        fi
-    elif [ -e "$alias_link" ]; then
-        echo "  skipping: $alias_link exists and is not a symlink; refusing to touch it" >&2
-        return 1
-    fi
-
-    if ! pyenv virtualenv "$NEW_VERS" "$venv_name"; then
-        echo "  error: could not create $venv_name on $NEW_VERS" >&2
-        rollback_venv "$alias_link" "$stashed_alias"
-        echo "  the original virtualenv on $OLD_VERS is intact" >&2
-        return 1
-    fi
-
-    if ! "$new_prefix/bin/pip" install -r "$reqs"; then
-        echo "  error: could not install $venv_name's packages on $NEW_VERS" >&2
-        pyenv uninstall -f "$NEW_VERS/envs/$venv_name" >/dev/null 2>&1
-        rollback_venv "$alias_link" "$stashed_alias"
-        echo "  the original virtualenv on $OLD_VERS is intact" >&2
-        echo "  requirements kept at $reqs" >&2
-        return 1
-    fi
-
-    # The replacement is good; retire the original and the stashed alias.
-    rm -f "$stashed_alias"
-    pyenv uninstall -f "$OLD_VERS/envs/$venv_name" || return 1
-    # pyenv-virtualenv's uninstall hook may take the alias with it; make sure
-    # it still resolves to the new environment.
-    if [ ! -e "$alias_link" ]; then
-        ln -s "$new_prefix" "$alias_link"
-    fi
-    return 0
-}
-
+# update-venv owns the rollback-safe move; collect the names on $OLD_VERS and
+# hand them over rather than keeping a second copy of that logic here.
 venv_failures=0
 if [ -n "$MIGRATE_VENVS" ] && [ -n "$OLD_VERS" ]; then
     if has_pyenv_command virtualenvs; then
-        BACKUP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-python/$(date +%Y%m%d-%H%M%S)"
-        mkdir -p "$BACKUP_DIR" || exit $?
-
         venv_prefix="$OLD_VERS/envs/"
-        venvs_migrated=0
+        venv_names=()
         while IFS= read -r line; do
             # Quoted so version numbers are matched literally, not as globs.
             case $line in
@@ -222,19 +144,11 @@ if [ -n "$MIGRATE_VENVS" ] && [ -n "$OLD_VERS" ]; then
             esac
             name=${line#"$venv_prefix"}
             [ -n "$name" ] || continue
-
-            echo "Migrating virtualenv $name -> $NEW_VERS"
-            if migrate_venv "$name"; then
-                venvs_migrated=$((venvs_migrated + 1))
-                echo "  migrated $name -> $NEW_VERS"
-            else
-                venv_failures=$((venv_failures + 1))
-            fi
+            venv_names[${#venv_names[@]}]=$name
         done < <(pyenv virtualenvs --bare --skip-aliases 2>/dev/null)
 
-        echo "Migrated $venvs_migrated virtualenv(s), $venv_failures failed."
-        if [ "$venv_failures" -gt 0 ]; then
-            echo "Frozen requirements are under $BACKUP_DIR" >&2
+        if [ ${#venv_names[@]} -gt 0 ]; then
+            update-venv --to "$NEW_VERS" "${venv_names[@]}" || venv_failures=1
         fi
     else
         echo "warning: 'pyenv virtualenvs' is not available; skipping virtualenv migration" >&2
