@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+#
+# Install a pyenv version and migrate an existing version's packages onto it.
+#
+# Deliberately kept compatible with bash 3.2, the /bin/bash that ships with
+# macOS: no mapfile/readarray, no associative arrays, and no unguarded
+# "${arr[@]}" on a possibly-empty array under `set -u`.
+#
+# `set -e` is *not* used: virtualenv migration has to be able to fail for one
+# environment without abandoning the rest, so errors are handled explicitly.
+
+set -uo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: update-python [--migrate-venvs] [--force] NEW_VERSION [OLD_VERSION]
+
+Installs NEW_VERSION with pyenv and migrates OLD_VERSION's packages onto it.
+OLD_VERSION defaults to the first entry of `pyenv global`.
+
+  --migrate-venvs  also recreate OLD_VERSION's virtualenvs on NEW_VERSION
+  --force          reinstall NEW_VERSION even if already installed
+                   (this discards that version's installed packages)
+EOF
+}
+
+MIGRATE_VENVS=
+FORCE=
+NEW_VERS=
+OLD_VERS=
+EXTRA=
+for arg in "$@"; do
+    case $arg in
+        --migrate-venvs) MIGRATE_VENVS=1 ;;
+        --force) FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*)
+            echo "error: unknown option: $arg" >&2
+            usage
+            exit 2
+            ;;
+        *)
+            if [ -z "$NEW_VERS" ]; then
+                NEW_VERS=$arg
+            elif [ -z "$OLD_VERS" ]; then
+                OLD_VERS=$arg
+            else
+                EXTRA=$arg
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$NEW_VERS" ]; then
+    echo "error: NEW_VERSION is required" >&2
+    usage
+    exit 2
+fi
+if [ -n "$EXTRA" ]; then
+    echo "error: unexpected argument: $EXTRA" >&2
+    usage
+    exit 2
+fi
+
+ROOT=$(pyenv root) || exit $?
+
+if [ -z "$OLD_VERS" ]; then
+    OLD_VERS=$(pyenv global | head -n1) || exit $?
+fi
+# `system` is not a pyenv-managed prefix, so there is nothing to migrate from.
+if [ -z "$OLD_VERS" ] || [ "$OLD_VERS" = system ]; then
+    echo "No pyenv version to migrate from; installing $NEW_VERS only."
+    OLD_VERS=
+elif [ ! -d "$ROOT/versions/$OLD_VERS" ]; then
+    echo "error: $OLD_VERS is not installed" >&2
+    exit 2
+fi
+
+has_pyenv_command() {
+    pyenv commands 2>/dev/null | grep -qx "$1"
+}
+
+# --- install ----------------------------------------------------------------
+
+# `pyenv install -f` rebuilds in place, throwing away whatever is already
+# installed into that prefix, so only force when explicitly asked to.
+if [ -d "$ROOT/versions/$NEW_VERS" ] && [ -z "$FORCE" ]; then
+    echo "$NEW_VERS is already installed; skipping install (use --force to rebuild)."
+elif [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # The optimised build flags only make sense for a numeric CPython release.
+    PYTHON_CONFIGURE_OPTS="--enable-optimizations --with-lto=full" \
+        PYTHON_CFLAGS="-march=native -mtune=native" \
+        pyenv install -v -f "$NEW_VERS" || exit $?
+else
+    pyenv install -v -f "$NEW_VERS" || exit $?
+fi
+
+# --- migrate packages -------------------------------------------------------
+
+if [ -n "$OLD_VERS" ]; then
+    if has_pyenv_command migrate; then
+        pyenv migrate "$OLD_VERS" "$NEW_VERS" || exit $?
+    else
+        echo "warning: 'pyenv migrate' is not available; skipping package migration" >&2
+    fi
+fi
+
+# --- point `pyenv global` at the new version --------------------------------
+
+if [ -n "$OLD_VERS" ]; then
+    new_globals=()
+    replaced=
+    while IFS= read -r version; do
+        [ -n "$version" ] || continue
+        if [ "$version" = "$OLD_VERS" ]; then
+            new_globals[${#new_globals[@]}]=$NEW_VERS
+            replaced=1
+        else
+            new_globals[${#new_globals[@]}]=$version
+        fi
+    done < <(pyenv global)
+
+    if [ -z "$replaced" ]; then
+        echo "Note: $OLD_VERS is not in 'pyenv global'; leaving the global versions unchanged."
+    elif [ ${#new_globals[@]} -gt 0 ]; then
+        pyenv global "${new_globals[@]}" || exit $?
+    fi
+fi
+
+# --- migrate virtualenvs ----------------------------------------------------
+
+rollback_venv() {
+    alias_link=$1
+    stashed_alias=$2
+    # Only ever removes a symlink: a real directory here would fail `rm -f`.
+    rm -f "$alias_link"
+    if [ -L "$stashed_alias" ]; then
+        mv "$stashed_alias" "$alias_link"
+    fi
+}
+
+# Recreate a single virtualenv on $NEW_VERS, rolling back to the original on
+# any failure. The original prefix is only removed once the replacement exists
+# and its packages are installed, and the frozen requirements are written to
+# disk before anything is touched, so a failure is always recoverable.
+migrate_venv() {
+    local venv_name=$1
+    local old_prefix="$ROOT/versions/$OLD_VERS/envs/$venv_name"
+    local new_prefix="$ROOT/versions/$NEW_VERS/envs/$venv_name"
+    local alias_link="$ROOT/versions/$venv_name"
+    local stashed_alias="$alias_link.update-python-bak"
+    local reqs="$BACKUP_DIR/$venv_name.txt"
+
+    if [ -e "$new_prefix" ]; then
+        echo "  skipping: $venv_name already exists on $NEW_VERS" >&2
+        return 1
+    fi
+    if [ ! -x "$old_prefix/bin/pip" ]; then
+        echo "  skipping: no pip in $old_prefix" >&2
+        return 1
+    fi
+
+    if ! "$old_prefix/bin/pip" freeze >"$reqs"; then
+        echo "  error: could not freeze $venv_name; leaving it untouched" >&2
+        return 1
+    fi
+    echo "  saved requirements to $reqs"
+
+    # The replacement cannot be created while the top-level alias symlink still
+    # points at the original, so move it aside rather than deleting it. This is
+    # the only mutation made before the new environment is known to be good.
+    if [ -L "$alias_link" ]; then
+        if ! mv "$alias_link" "$stashed_alias"; then
+            echo "  error: could not move $alias_link aside" >&2
+            return 1
+        fi
+    elif [ -e "$alias_link" ]; then
+        echo "  skipping: $alias_link exists and is not a symlink; refusing to touch it" >&2
+        return 1
+    fi
+
+    if ! pyenv virtualenv "$NEW_VERS" "$venv_name"; then
+        echo "  error: could not create $venv_name on $NEW_VERS" >&2
+        rollback_venv "$alias_link" "$stashed_alias"
+        echo "  the original virtualenv on $OLD_VERS is intact" >&2
+        return 1
+    fi
+
+    if ! "$new_prefix/bin/pip" install -r "$reqs"; then
+        echo "  error: could not install $venv_name's packages on $NEW_VERS" >&2
+        pyenv uninstall -f "$NEW_VERS/envs/$venv_name" >/dev/null 2>&1
+        rollback_venv "$alias_link" "$stashed_alias"
+        echo "  the original virtualenv on $OLD_VERS is intact" >&2
+        echo "  requirements kept at $reqs" >&2
+        return 1
+    fi
+
+    # The replacement is good; retire the original and the stashed alias.
+    rm -f "$stashed_alias"
+    pyenv uninstall -f "$OLD_VERS/envs/$venv_name" || return 1
+    # pyenv-virtualenv's uninstall hook may take the alias with it; make sure
+    # it still resolves to the new environment.
+    if [ ! -e "$alias_link" ]; then
+        ln -s "$new_prefix" "$alias_link"
+    fi
+    return 0
+}
+
+venv_failures=0
+if [ -n "$MIGRATE_VENVS" ] && [ -n "$OLD_VERS" ]; then
+    if has_pyenv_command virtualenvs; then
+        BACKUP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-python/$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$BACKUP_DIR" || exit $?
+
+        venv_prefix="$OLD_VERS/envs/"
+        venvs_migrated=0
+        while IFS= read -r line; do
+            # Quoted so version numbers are matched literally, not as globs.
+            case $line in
+                "$venv_prefix"*) ;;
+                *) continue ;;
+            esac
+            name=${line#"$venv_prefix"}
+            [ -n "$name" ] || continue
+
+            echo "Migrating virtualenv $name -> $NEW_VERS"
+            if migrate_venv "$name"; then
+                venvs_migrated=$((venvs_migrated + 1))
+                echo "  migrated $name -> $NEW_VERS"
+            else
+                venv_failures=$((venv_failures + 1))
+            fi
+        done < <(pyenv virtualenvs --bare --skip-aliases 2>/dev/null)
+
+        echo "Migrated $venvs_migrated virtualenv(s), $venv_failures failed."
+        if [ "$venv_failures" -gt 0 ]; then
+            echo "Frozen requirements are under $BACKUP_DIR" >&2
+        fi
+    else
+        echo "warning: 'pyenv virtualenvs' is not available; skipping virtualenv migration" >&2
+    fi
+fi
+
+if [ -n "$OLD_VERS" ]; then
+    echo "If you no longer need the old version, remove it with:"
+    echo "pyenv uninstall $OLD_VERS"
+fi
+
+[ "$venv_failures" -eq 0 ] || exit 1
