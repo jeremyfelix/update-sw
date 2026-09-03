@@ -13,19 +13,31 @@ set -uo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-usage: update-python [--migrate-venvs] [--force] NEW_VERSION [OLD_VERSION]
+usage: update-python [--migrate-venvs] [--force|--rebuild] [--no-jit]
+                     NEW_VERSION [OLD_VERSION]
 
 Installs NEW_VERSION with pyenv and migrates OLD_VERSION's packages onto it.
 OLD_VERSION defaults to the first entry of `pyenv global`.
 
   --migrate-venvs  also recreate OLD_VERSION's virtualenvs on NEW_VERSION
-  --force          reinstall NEW_VERSION even if already installed
-                   (this discards that version's installed packages)
+  --force          reinstall NEW_VERSION even if already installed. The build
+                   overwrites the existing prefix in place, so its packages and
+                   virtualenvs survive, but a build that fails part-way leaves
+                   that prefix broken.
+  --rebuild        --force with a safety net: snapshot the prefix first and put
+                   it back if the build fails (implies --force)
+  --no-jit         build without the copy-and-patch JIT (CPython 3.13+), which
+                   otherwise requires a matching LLVM to be installed
+
+CPython 3.13+ is built with the JIT compiled in but dormant, matching the
+python.org binaries; run with PYTHON_JIT=1 to use it.
 EOF
 }
 
 MIGRATE_VENVS=
 FORCE=
+REBUILD=
+NO_JIT=
 NEW_VERS=
 OLD_VERS=
 EXTRA=
@@ -33,6 +45,8 @@ for arg in "$@"; do
     case $arg in
         --migrate-venvs) MIGRATE_VENVS=1 ;;
         --force) FORCE=1 ;;
+        --rebuild) REBUILD=1; FORCE=1 ;;
+        --no-jit) NO_JIT=1 ;;
         -h|--help) usage; exit 0 ;;
         -*)
             echo "error: unknown option: $arg" >&2
@@ -80,19 +94,170 @@ has_pyenv_command() {
     pyenv commands 2>/dev/null | grep -qx "$1"
 }
 
+# CPython's JIT needs a *specific* major version of LLVM to build its stencils,
+# pinned per release series in Tools/jit/_llvm.py. Apple's clang is explicitly
+# rejected there no matter how new it is, so /usr/bin/clang never counts.
+jit_llvm_version() {
+    # 3.13 pins LLVM 18, 3.14 pins 19. Assume a later series keeps the newest
+    # requirement we know about rather than quietly dropping the JIT; a wrong
+    # guess surfaces as an error naming a version, not as a missing feature.
+    if [ "$1" -le 13 ]; then echo 18; else echo 19; fi
+}
+
+# True if $2 is an LLVM tool of major version $1 (and not Apple's clang).
+is_llvm_tool() {
+    command -v "$2" >/dev/null 2>&1 || return 1
+    "$2" --version 2>/dev/null \
+        | grep -E "(LLVM|clang) version $1\\." \
+        | grep -qv "Apple clang"
+}
+
+# Tools/jit/build.py looks on PATH, at versioned names like clang-19, and
+# inside Homebrew's keg-only llvm@N. Mirror that search so a missing toolchain
+# is reported up front instead of part-way through a PGO build.
+has_jit_llvm() {
+    local llvm_ver=$1 brew_bin= brew_prefix= tool
+    if command -v brew >/dev/null 2>&1; then
+        # `brew --prefix llvm@N` prints a path whether or not it is installed,
+        # so the tool check below is what actually decides.
+        brew_prefix=$(brew --prefix "llvm@$llvm_ver" 2>/dev/null)
+        [ -n "$brew_prefix" ] && brew_bin="$brew_prefix/bin"
+    fi
+    for tool in clang llvm-readobj; do
+        is_llvm_tool "$llvm_ver" "$tool-$llvm_ver" && continue
+        is_llvm_tool "$llvm_ver" "$tool" && continue
+        [ -n "$brew_bin" ] && is_llvm_tool "$llvm_ver" "$brew_bin/$tool" && continue
+        return 1
+    done
+    return 0
+}
+
 # --- install ----------------------------------------------------------------
 
-# `pyenv install -f` rebuilds in place, throwing away whatever is already
-# installed into that prefix, so only force when explicitly asked to.
-if [ -d "$ROOT/versions/$NEW_VERS" ] && [ -z "$FORCE" ]; then
-    echo "$NEW_VERS is already installed; skipping install (use --force to rebuild)."
-elif [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    # The optimised build flags only make sense for a numeric CPython release.
-    PYTHON_CONFIGURE_OPTS="--enable-optimizations --with-lto=full" \
-        PYTHON_CFLAGS="-march=native -mtune=native" \
-        pyenv install -v -f "$NEW_VERS" || exit $?
+# `pyenv install -f` overwrites a prefix in place rather than replacing it:
+# pyenv-install only removes a prefix it created itself (its cleanup is guarded
+# on the prefix not having existed beforehand), and nothing in python-build
+# touches lib/pythonX.Y/site-packages or envs/. A forced rebuild therefore
+# keeps its packages and virtualenvs. What it cannot survive is a build that
+# dies part-way, which leaves the prefix half-overwritten and unbootable with
+# no way back -- that is what --rebuild's snapshot is for.
+PREFIX="$ROOT/versions/$NEW_VERS"
+BACKUP=
+
+restore_backup() {
+    [ -n "$BACKUP" ] && [ -d "$BACKUP" ] || return 0
+    echo "Restoring $NEW_VERS from its pre-rebuild snapshot..." >&2
+    if rm -rf "$PREFIX" && mv "$BACKUP" "$PREFIX"; then
+        BACKUP=
+    else
+        echo "error: could not restore the snapshot; it is still at $BACKUP" >&2
+        return 1
+    fi
+}
+
+discard_backup() {
+    [ -n "$BACKUP" ] || return 0
+    trap - INT TERM
+    rm -rf "$BACKUP"
+    BACKUP=
+}
+
+if [ -n "$REBUILD" ] && [ -d "$PREFIX" ]; then
+    # Not under versions/, because `pyenv versions` lists every entry there
+    # whether or not it is dot-prefixed; still under $ROOT so it stays on the
+    # same filesystem, where `cp -c` clones on APFS (near-instant, costing no
+    # space until the rebuild starts overwriting files) and the restoring `mv`
+    # is a rename. Restoring in place matters: the interpreter links against an
+    # absolute .../versions/$NEW_VERS/lib/libpython path, so a prefix is only
+    # usable from where it was built.
+    BACKUP="$ROOT/.update-python-backup.$NEW_VERS.$$"
+    rm -rf "$BACKUP"
+    echo "Snapshotting $NEW_VERS before rebuilding it..."
+    # `cp -c` is macOS-only; the retry clears any partial copy first, because
+    # BSD cp would otherwise nest the source inside the leftover directory.
+    cp -Rpc "$PREFIX" "$BACKUP" 2>/dev/null ||
+        { rm -rf "$BACKUP" && cp -Rp "$PREFIX" "$BACKUP"; } || {
+            echo "error: could not snapshot $PREFIX" >&2
+            exit 1
+        }
+    trap 'restore_backup; exit 130' INT TERM
+fi
+
+install_status=0
+if [ -d "$PREFIX" ] && [ -z "$FORCE" ]; then
+    echo "$NEW_VERS is already installed; skipping install."
+    echo "Use --rebuild to rebuild it (keeping its packages), or --force to do so"
+    echo "without a snapshot to roll back to."
+elif [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+\.[0-9]+t?$ ]]; then
+    # The optimized build flags only make sense for a numeric CPython release.
+    # The `t` suffix is pyenv's spelling of a freethreaded build (3.14.7t): it
+    # is the same source tarball with --disable-gil added, so PGO, LTO and the
+    # native tuning all still apply.
+    configure_opts="--enable-optimizations --with-lto=full"
+
+    # Named once so the interpreter and the JIT's stencils, which are compiled
+    # by two separate toolchains, end up tuned for the same machine.
+    native_cflags="-march=native -mtune=native"
+
+    major=${NEW_VERS%%.*}
+    minor=${NEW_VERS#*.}; minor=${minor%%.*}
+    freethreaded=
+    case $NEW_VERS in *t) freethreaded=1 ;; esac
+
+    # CPython 3.13 gained the copy-and-patch JIT; it is absent unless
+    # configured in, which is why stock pyenv builds have no sys._jit.
+    # `=yes-off` compiles it in but leaves it dormant, so PYTHON_JIT=1 opts a
+    # single process into it -- the same arrangement as the python.org
+    # binaries, and what makes an A/B against the plain interpreter possible
+    # without keeping two builds around. `=yes` would have it on by default.
+    jit_enabled=
+    if [ -z "$NO_JIT" ] && [ -z "$freethreaded" ] &&
+       [ "$major" -eq 3 ] && [ "$minor" -ge 13 ]; then
+        llvm_ver=$(jit_llvm_version "$minor")
+        if ! has_jit_llvm "$llvm_ver"; then
+            echo "error: building the JIT needs clang and llvm-readobj from LLVM $llvm_ver," >&2
+            echo "       which Apple's clang does not provide. Install it with:" >&2
+            echo "         brew install llvm@$llvm_ver" >&2
+            echo "       or re-run with --no-jit to build without the JIT." >&2
+            discard_backup
+            exit 1
+        fi
+        configure_opts="$configure_opts --enable-experimental-jit=yes-off"
+        jit_enabled=1
+
+        # Tools/jit/_targets.py builds its own argument list and never sees
+        # CFLAGS, so without this the JIT'd traces would be generic code inside
+        # an interpreter tuned for this machine. configure reads CFLAGS_JIT
+        # straight out of the environment, which is also the only way to pass a
+        # value containing spaces: python-build word-splits its *_CONFIGURE_OPTS.
+        export CFLAGS_JIT="$native_cflags"
+    elif [ -n "$freethreaded" ] && [ -z "$NO_JIT" ] &&
+         [ "$major" -eq 3 ] && [ "$minor" -ge 13 ]; then
+        # Not a silent omission: configure rejects the combination outright,
+        # because such a build compiles the JIT and then never uses it.
+        echo "Note: the JIT is unavailable on freethreaded builds; building $NEW_VERS without it."
+    fi
+
+    PYTHON_CONFIGURE_OPTS="$configure_opts" \
+        PYTHON_CFLAGS="$native_cflags" \
+        pyenv install -v -f "$NEW_VERS"
+    install_status=$?
 else
-    pyenv install -v -f "$NEW_VERS" || exit $?
+    pyenv install -v -f "$NEW_VERS"
+    install_status=$?
+fi
+
+if [ "$install_status" -ne 0 ]; then
+    restore_backup
+    exit "$install_status"
+fi
+discard_backup
+
+# Dormant is easy to forget, and a JIT nobody switches on is indistinguishable
+# from the missing one this script set out to fix.
+if [ -n "${jit_enabled:-}" ]; then
+    echo "$NEW_VERS has the JIT compiled in but dormant. To use it:"
+    echo "PYTHON_JIT=1 python3 -c 'import sys; print(sys._jit.is_enabled())'"
 fi
 
 # --- migrate packages -------------------------------------------------------
