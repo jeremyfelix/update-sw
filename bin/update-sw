@@ -949,6 +949,52 @@ class MacOsUpdater(CommandBasedUpdater):
         return ()
 
 
+class MasUpdater(CommandBasedUpdater):
+    """Updates Mac App Store apps with the `mas` command line tool."""
+
+    @staticmethod
+    def has_mas() -> bool:
+        return shutil.which('mas') is not None
+
+    @property
+    def name(self) -> str:
+        return 'mas'
+
+    @property
+    def update_cmd(self) -> tuple[str, ...]:
+        # `mas outdated` queries the App Store itself.
+        return ()
+
+    @property
+    def outdated_cmd(self) -> tuple[str, ...]:
+        # --accurate is slower, but the default check misses some updates.
+        return ('mas', 'outdated', '--accurate')
+
+    @property
+    def has_updates(self) -> bool:
+        return self.outdated_output.strip() != ''
+
+    @property
+    def upgrade_cmd(self) -> tuple[str, ...]:
+        # mas needs root to install app updates.
+        return ('sudo', 'mas', 'upgrade', '--accurate')
+
+    @property
+    def cleanup_cmd(self) -> tuple[str, ...]:
+        return ()
+
+    def outdated(self):
+        # Reached when the user asked for this updater by name; the default
+        # set leaves it out unless mas is installed.
+        if not self.has_mas():
+            print(self.outdated_banner)
+            print('mas is not installed.\nInstall it with: brew install mas')
+            print()
+            self.outdated_output = ''
+            return
+        super().outdated()
+
+
 class RustupUpdater(CommandBasedUpdater):
     @staticmethod
     def has_rustup() -> bool:
@@ -1136,7 +1182,11 @@ def default_updaters() -> list[str]:
     names: list[str]
     match platform.system():
         case 'Darwin':
-            names = ['macos', 'brew', 'pip']
+            names = ['macos', 'brew']
+            # After brew, which is what installs and upgrades mas itself.
+            if MasUpdater.has_mas():
+                names.append('mas')
+            names.append('pip')
         case 'Linux':
             import distro  # type: ignore
 
@@ -1180,6 +1230,7 @@ def build_registry(args) -> dict[str, Callable[[], Updater]]:
         'apt': AptUpdater,
         'emerge': EmergeUpdater,
         'macos': MacOsUpdater,
+        'mas': MasUpdater,
         'windows-update': WindowsUpdateUpdater,
         'windows-store': WindowsStoreUpdater,
         'rustup': RustupUpdater,
