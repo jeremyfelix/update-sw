@@ -14,10 +14,12 @@ set -uo pipefail
 usage() {
     cat >&2 <<'EOF'
 usage: update-python [--migrate-venvs] [--force|--rebuild] [--no-jit]
-                     NEW_VERSION [OLD_VERSION]
+                     [--skip-deps-check] NEW_VERSION [OLD_VERSION]
 
 Installs NEW_VERSION with pyenv and migrates OLD_VERSION's packages onto it.
-OLD_VERSION defaults to the first entry of `pyenv global`.
+OLD_VERSION defaults to the first entry of `pyenv global`, except when
+rebuilding an installed NEW_VERSION, which keeps its own packages instead.
+A prefix such as 3.15 means the newest installed 3.15.x, as in pyenv.
 
   --migrate-venvs  also recreate OLD_VERSION's virtualenvs on NEW_VERSION
   --force          reinstall NEW_VERSION even if already installed. The build
@@ -28,6 +30,9 @@ OLD_VERSION defaults to the first entry of `pyenv global`.
                    it back if the build fails (implies --force)
   --no-jit         build without the copy-and-patch JIT (CPython 3.13+), which
                    otherwise requires a matching LLVM to be installed
+  --skip-deps-check
+                   don't probe for missing -dev headers before a source build
+                   (they are checked on Linux only, and a missing one is fatal)
 
 CPython 3.13+ is built with the JIT compiled in but dormant, matching the
 python.org binaries; run with PYTHON_JIT=1 to use it.
@@ -38,6 +43,7 @@ MIGRATE_VENVS=
 FORCE=
 REBUILD=
 NO_JIT=
+SKIP_DEPS_CHECK=
 NEW_VERS=
 OLD_VERS=
 EXTRA=
@@ -47,6 +53,7 @@ for arg in "$@"; do
         --force) FORCE=1 ;;
         --rebuild) REBUILD=1; FORCE=1 ;;
         --no-jit) NO_JIT=1 ;;
+        --skip-deps-check) SKIP_DEPS_CHECK=1 ;;
         -h|--help) usage; exit 0 ;;
         -*)
             echo "error: unknown option: $arg" >&2
@@ -78,16 +85,39 @@ fi
 
 ROOT=$(pyenv root) || exit $?
 
+IN_PLACE=
 if [ -z "$OLD_VERS" ]; then
-    OLD_VERS=$(pyenv global | head -n1) || exit $?
+    if [ -n "$FORCE" ] && [ -d "$ROOT/versions/$NEW_VERS" ]; then
+        # A rebuild keeps the prefix's own packages, so defaulting to the
+        # global version would only pour some other version's packages in.
+        echo "Rebuilding $NEW_VERS in place; nothing to migrate."
+        IN_PLACE=1
+    else
+        OLD_VERS=$(pyenv global | head -n1) || exit $?
+    fi
 fi
+# As written in `pyenv global`, which may be a prefix such as `3.15`; the
+# global rewrite below has to match this spelling, not the resolved one.
+OLD_SPEC=$OLD_VERS
 # `system` is not a pyenv-managed prefix, so there is nothing to migrate from.
-if [ -z "$OLD_VERS" ] || [ "$OLD_VERS" = system ]; then
+if [ -n "$IN_PLACE" ]; then
+    :
+elif [ -z "$OLD_VERS" ] || [ "$OLD_VERS" = system ]; then
     echo "No pyenv version to migrate from; installing $NEW_VERS only."
     OLD_VERS=
 elif [ ! -d "$ROOT/versions/$OLD_VERS" ]; then
-    echo "error: $OLD_VERS is not installed" >&2
-    exit 2
+    # pyenv resolves a prefix to the newest installed match, so do the same.
+    resolved=$(pyenv latest "$OLD_VERS" 2>/dev/null)
+    if [ -n "$resolved" ] && [ -d "$ROOT/versions/$resolved" ]; then
+        OLD_VERS=$resolved
+    else
+        echo "error: $OLD_VERS is not installed" >&2
+        exit 2
+    fi
+fi
+if [ -n "$OLD_VERS" ] && [ "$OLD_VERS" = "$NEW_VERS" ]; then
+    echo "$OLD_SPEC is $NEW_VERS itself; nothing to migrate."
+    OLD_VERS=
 fi
 
 has_pyenv_command() {
@@ -95,13 +125,28 @@ has_pyenv_command() {
 }
 
 # CPython's JIT needs a *specific* major version of LLVM to build its stencils,
-# pinned per release series in Tools/jit/_llvm.py. Apple's clang is explicitly
+# pinned per release in Tools/jit/_llvm.py. Apple's clang is explicitly
 # rejected there no matter how new it is, so /usr/bin/clang never counts.
 jit_llvm_version() {
-    # 3.13 pins LLVM 18, 3.14 pins 19. Assume a later series keeps the newest
-    # requirement we know about rather than quietly dropping the JIT; a wrong
-    # guess surfaces as an error naming a version, not as a missing feature.
-    if [ "$1" -le 13 ]; then echo 18; else echo 19; fi
+    # Ask the release itself, so a new series needs no edit here. The value is
+    # a bare int through 3.14 (`_LLVM_VERSION = 19`) and a string from 3.15 on
+    # (`_LLVM_VERSION = "21"`), hence the optional quotes.
+    local tag=v${1%t} minor=$2 ver
+    ver=$(curl -fsSL --max-time 15 \
+            "https://raw.githubusercontent.com/python/cpython/$tag/Tools/jit/_llvm.py" \
+            2>/dev/null \
+        | sed -nE 's/^_LLVM_VERSION = "?([0-9]+)"?.*/\1/p' | head -n1)
+    if [ -n "$ver" ]; then echo "$ver"; return; fi
+
+    # Offline, or a tag GitHub does not have: fall back to the known pins.
+    # A later series is assumed to keep the newest one rather than quietly
+    # dropping the JIT; a wrong guess surfaces as an error naming a version,
+    # not as a missing feature.
+    echo "warning: could not read the LLVM pin for $tag; guessing." >&2
+    if [ "$minor" -le 13 ]; then echo 18
+    elif [ "$minor" -eq 14 ]; then echo 19
+    else echo 21
+    fi
 }
 
 # True if $2 is an LLVM tool of major version $1 (and not Apple's clang).
@@ -130,6 +175,28 @@ has_jit_llvm() {
         return 1
     done
     return 0
+}
+
+jit_llvm_hint() {
+    echo "error: building the JIT needs clang and llvm-readobj from LLVM $1."
+    if [ "$(uname -s)" = Darwin ]; then
+        echo "       Apple's clang does not count, however new. Install it with:"
+        echo "         brew install llvm@$1"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "       Install it with:"
+        echo "         sudo apt install clang-$1 llvm-$1"
+        echo "       If your release does not package LLVM $1, https://apt.llvm.org does."
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        # RHEL's llvm-toolset carries one LLVM version; Fedora also packages
+        # older ones as versioned compat packages (clang19, llvm19, ...).
+        echo "       Install it with: sudo $(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum) install clang llvm"
+        echo "       then check that \`clang --version\` reports LLVM $1. On Fedora, if"
+        echo "       the default is a different version, install clang$1 llvm$1 instead."
+    else
+        echo "       Install that version with your package manager, so that clang-$1"
+        echo "       and llvm-readobj-$1 (or unversioned tools of that version) are on PATH."
+    fi
+    echo "       Or re-run with --no-jit to build without the JIT."
 }
 
 # --- install ----------------------------------------------------------------
@@ -161,6 +228,117 @@ discard_backup() {
     rm -rf "$BACKUP"
     BACKUP=
 }
+
+# CPython's configure quietly skips any stdlib module whose headers are absent,
+# so a missing -dev package only shows up at the end of a long PGO build (or
+# as a python-build error about ssl). Probe the headers up front instead. Only
+# on Linux: on macOS python-build pulls openssl and friends from Homebrew, and
+# the SDK covers the rest.
+# Each entry is module:headers:apt-package:dnf-package. headers lists
+# alternatives separated by commas (a module is satisfied by any one of them),
+# because distros disagree on where a header lives; configure accepts all of
+# them. The package is only named in the hint when apt, dnf or yum is around.
+BUILD_DEPS="
+ssl:openssl/ssl.h:libssl-dev:openssl-devel
+zlib:zlib.h:zlib1g-dev:zlib-devel
+bz2:bzlib.h:libbz2-dev:bzip2-devel
+lzma:lzma.h:liblzma-dev:xz-devel
+ctypes:ffi.h:libffi-dev:libffi-devel
+readline:readline/readline.h:libreadline-dev:readline-devel
+curses:ncursesw/curses.h,ncurses/curses.h,curses.h:libncurses-dev:ncurses-devel
+sqlite3:sqlite3.h:libsqlite3-dev:sqlite-devel
+uuid:uuid/uuid.h:uuid-dev:libuuid-devel
+dbm.gnu:gdbm.h:libgdbm-dev:gdbm-devel
+dbm.ndbm:ndbm.h,gdbm/ndbm.h,gdbm-ndbm.h:libgdbm-compat-dev:gdbm-devel
+compression.zstd:zstd.h:libzstd-dev:libzstd-devel
+tkinter:tk.h:tk-dev:tk-devel
+"
+
+has_header() {
+    # Ubuntu keeps tk.h under /usr/include/tcl8.6, which tk.pc points at.
+    local cflags=
+    [ "$1" = tk.h ] && cflags=$(pkg-config --cflags tk 2>/dev/null)
+    # $cflags and $CPPFLAGS are deliberately unquoted: they are lists of -I
+    # flags, and python-build honours CPPFLAGS, so the probe must too.
+    printf '#include <%s>\n' "$1" | cc $cflags ${CPPFLAGS:-} -E -x c - >/dev/null 2>&1
+}
+
+# $1 is the CPython minor version; compression.zstd only exists from 3.14.
+check_build_deps() {
+    [ "$(uname -s)" = Linux ] || return 0
+    local minor=$1
+    # Which package manager to name in hints: apt, dnf, yum, or none.
+    local pm=
+    if command -v apt-get >/dev/null 2>&1; then pm=apt
+    elif command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    fi
+    if ! command -v cc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+        case $pm in
+            apt)
+                echo "error: no C compiler or make found. Install them with:" >&2
+                echo "         sudo apt install build-essential pkg-config" >&2 ;;
+            dnf|yum)
+                echo "error: no C compiler or make found. Install them with:" >&2
+                echo "         sudo $pm install gcc make pkgconf-pkg-config" >&2 ;;
+            *)
+                echo "error: no C compiler or make found; install them with your package manager." >&2 ;;
+        esac
+        return 1
+    fi
+    local entry mod rest headers apt_pkg dnf_pkg pkg h found word
+    local missing_pkgs= missing_mods= missing_headers=
+    for entry in $BUILD_DEPS; do
+        mod=${entry%%:*}; rest=${entry#*:}
+        headers=${rest%%:*}; rest=${rest#*:}
+        apt_pkg=${rest%%:*}; dnf_pkg=${rest#*:}
+        [ "$mod" = compression.zstd ] && [ "$minor" -lt 14 ] && continue
+        found=
+        # Any one alternative header is enough.
+        for h in ${headers//,/ }; do
+            has_header "$h" && { found=1; break; }
+        done
+        [ -n "$found" ] && continue
+        case $pm in
+            apt) pkg=$apt_pkg ;;
+            *) pkg=$dnf_pkg ;;
+        esac
+        # configure finds tk through pkg-config, so without it the tk package
+        # alone would not help; name both so one install covers it.
+        if [ "$mod" = tkinter ] && ! command -v pkg-config >/dev/null 2>&1; then
+            if [ "$pm" = apt ]; then pkg="pkg-config $pkg"; else pkg="pkgconf-pkg-config $pkg"; fi
+        fi
+        # Several modules can share a package (gdbm-devel); name it once.
+        for word in $pkg; do
+            case " $missing_pkgs " in
+                *" $word "*) ;;
+                *) missing_pkgs="$missing_pkgs $word" ;;
+            esac
+        done
+        missing_mods="$missing_mods $mod"
+        missing_headers="$missing_headers ${headers//,/|}"
+    done
+    [ -z "$missing_mods" ] && return 0
+    echo "error: headers are missing for these stdlib modules:$missing_mods" >&2
+    case $pm in
+        apt|dnf|yum)
+            echo "       Install them with:" >&2
+            echo "         sudo $pm install$missing_pkgs" >&2 ;;
+        *)
+            # Package names differ per distro, so point at the headers a
+            # -devel package must provide (any one of a|b|c will do).
+            echo "       Install the -devel packages that provide:$missing_headers" >&2 ;;
+    esac
+    return 1
+}
+
+# Only a source build needs headers; binary distributions (pypy3.11-7.3.20,
+# miniforge3-latest) don't. Anything starting N.N is built by python-build.
+if [ -z "$SKIP_DEPS_CHECK" ] && [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+ ]] &&
+   { [ ! -d "$PREFIX" ] || [ -n "$FORCE" ]; }; then
+    deps_minor=${NEW_VERS#*.}; deps_minor=${deps_minor%%[!0-9]*}
+    check_build_deps "$deps_minor" || exit 1
+fi
 
 if [ -n "$REBUILD" ] && [ -d "$PREFIX" ]; then
     # Not under versions/, because `pyenv versions` lists every entry there
@@ -213,12 +391,9 @@ elif [[ $NEW_VERS =~ ^[0-9]+\.[0-9]+\.[0-9]+t?$ ]]; then
     jit_enabled=
     if [ -z "$NO_JIT" ] && [ -z "$freethreaded" ] &&
        [ "$major" -eq 3 ] && [ "$minor" -ge 13 ]; then
-        llvm_ver=$(jit_llvm_version "$minor")
+        llvm_ver=$(jit_llvm_version "$NEW_VERS" "$minor")
         if ! has_jit_llvm "$llvm_ver"; then
-            echo "error: building the JIT needs clang and llvm-readobj from LLVM $llvm_ver," >&2
-            echo "       which Apple's clang does not provide. Install it with:" >&2
-            echo "         brew install llvm@$llvm_ver" >&2
-            echo "       or re-run with --no-jit to build without the JIT." >&2
+            jit_llvm_hint "$llvm_ver" >&2
             discard_backup
             exit 1
         fi
@@ -277,7 +452,13 @@ if [ -n "$OLD_VERS" ]; then
     replaced=
     while IFS= read -r version; do
         [ -n "$version" ] || continue
-        if [ "$version" = "$OLD_VERS" ]; then
+        if [ "$version" = "$OLD_SPEC" ] && [ "$OLD_SPEC" != "$OLD_VERS" ] &&
+           [ "$(pyenv latest "$OLD_SPEC" 2>/dev/null)" = "$NEW_VERS" ]; then
+            # A floating prefix such as 3.15 already resolves to NEW_VERS;
+            # pinning it would stop it following later patch releases.
+            new_globals[${#new_globals[@]}]=$version
+            replaced=1
+        elif [ "$version" = "$OLD_VERS" ] || [ "$version" = "$OLD_SPEC" ]; then
             new_globals[${#new_globals[@]}]=$NEW_VERS
             replaced=1
         else
@@ -286,7 +467,7 @@ if [ -n "$OLD_VERS" ]; then
     done < <(pyenv global)
 
     if [ -z "$replaced" ]; then
-        echo "Note: $OLD_VERS is not in 'pyenv global'; leaving the global versions unchanged."
+        echo "Note: $OLD_SPEC is not in 'pyenv global'; leaving the global versions unchanged."
     elif [ ${#new_globals[@]} -gt 0 ]; then
         pyenv global "${new_globals[@]}" || exit $?
     fi
