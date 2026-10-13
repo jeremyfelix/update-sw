@@ -1017,6 +1017,18 @@ class RustupUpdater(CommandBasedUpdater):
     def update_cmd(self) -> tuple[str, ...]:
         return ('rustup', 'self', 'update')
 
+    def _update(self):
+        # Self update is disabled in package-manager builds and may fail
+        # transiently; neither should block the toolchain update.
+        try:
+            self._run(self.update_cmd)
+        except subprocess.CalledProcessError as ex:
+            print(
+                f'{self.name}: self update failed ({ex}); '
+                'continuing with toolchain update',
+                file=sys.stderr,
+            )
+
     @property
     def outdated_cmd(self) -> tuple[str, ...]:
         return ('rustup', 'check')
@@ -1028,7 +1040,9 @@ class RustupUpdater(CommandBasedUpdater):
 
     @property
     def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('rustup', 'update')
+        # Self update was already attempted (or skipped via --skip-update)
+        # in the update step, so don't try it again.
+        return ('rustup', 'update', '--no-self-update')
 
     @property
     def cleanup_cmd(self) -> tuple[str, ...]:
