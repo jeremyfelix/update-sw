@@ -1,0 +1,63 @@
+# Configuration for update-sw (home/bin/update-sw).
+#
+# Everything here is commented out, so this file changes nothing as shipped.
+# Uncomment what you want.  Run `update-sw --list` to see the updater names;
+# a name that is not known is warned about and ignored.
+#
+# Besides this file, every *.py in ~/.config/update-sw/updaters/ is loaded as
+# a plugin; see the module docstring of update-sw for an example.
+
+# Replace the computed default list entirely.  Without this, the default is
+# every updater that applies to this platform and is installed.  The order
+# given here is the order they run in.
+# default = ['brew', 'pip']
+
+# Names removed from the default list.  (An updater named on the command
+# line still runs, unless it is also given with -x/--exclude.)
+# exclude = []
+
+# Names added to the default list: put where the built-in run order says if
+# the name is a built-in one, otherwise at the end.  Useful for an updater
+# that is not on by default here, such as mas on Linux or a plugin that sets
+# `default = False`.
+# extra = []
+
+# Options for the built-in updaters, in a table named after each one.
+
+# [pip]
+# Packages pip never upgrades.  Replaces the built-in list.
+# skip = ['inventory', 'utils']
+
+# [brew]
+# Add --fetch-HEAD to `brew outdated` and `brew upgrade`, so HEAD installs
+# are reported and updated too.  Default: true.
+# fetch_head = true
+
+# [cargo]
+# Add --git to `cargo install-update --list` and the upgrade, so packages
+# installed from git are reported and updated.  Slower.  Default: true.
+# git = true
+
+# Simple updaters defined entirely in this file.  The name must not belong
+# to a built-in updater.  Each step is a command, as a list of arguments;
+# leave a step out to skip it.
+#
+# [updaters.flatpak]
+# update = []
+# outdated = ['flatpak', 'remote-ls', '--updates']
+# upgrade = ['flatpak', 'update']
+# cleanup = ['flatpak', 'uninstall', '--unused']
+# # Output of `outdated` equal to this (ignoring surrounding whitespace)
+# # means nothing needs upgrading and the upgrade is not offered.  Default:
+# # empty, i.e. any output at all means there are updates.
+# no_updates_output = ''
+# # An executable that must be on PATH, or the updater counts as not
+# # available.
+# requires = 'flatpak'
+# # Include in the default list when available.  Default: false.
+# default = true
+# # Exit codes of `outdated`, besides 0, that are not failures.  Default: [].
+# outdated_ok_returncodes = []
+# # Set to false to report a failing `update` and carry on with the other
+# # steps instead of stopping.  Default: true.
+# update_is_fatal = true

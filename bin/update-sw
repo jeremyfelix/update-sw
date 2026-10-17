@@ -1,23 +1,101 @@
 #!/usr/bin/env python3
 
+"""Updates sw on my various platforms.
+
+Each kind of software is handled by an Updater: a class with up to four
+optional steps (update, outdated, upgrade, cleanup).  A step an updater does
+not implement is skipped without printing anything.  Updaters register
+themselves by name when their class is defined, and ORDER says which order
+they run in.
+
+Configuration
+-------------
+
+An optional TOML file, ${XDG_CONFIG_HOME:-~/.config}/update-sw/config.toml
+(or the file given with --config), adjusts what runs.  Every key is
+optional.  See the example file in the dotfiles repo for commentary.
+
+    # Replace the computed default list entirely (kept in the order given)
+    default = ['brew', 'pip']
+    exclude = []    # names removed from the default list
+    extra = []      # names added to the default list
+
+    [pip]
+    skip = ['inventory', 'utils']   # packages pip never upgrades
+
+    [brew]
+    fetch_head = true   # add --fetch-HEAD to outdated and upgrade
+
+    [cargo]
+    git = true          # add --git to --list and upgrade
+
+    # Simple updaters defined entirely in config.  `update`, `outdated`,
+    # `upgrade` and `cleanup` are commands (lists of arguments); omit a step
+    # to skip it.  Output of `outdated` that is empty (or equal to
+    # `no_updates_output`, ignoring surrounding whitespace) means there is
+    # nothing to upgrade.  `requires` is an executable that must be on PATH,
+    # and `default` includes the updater in the default list when it is
+    # available.  `outdated_ok_returncodes` and `update_is_fatal` behave as
+    # they do on CommandBasedUpdater.
+    [updaters.flatpak]
+    update = []
+    outdated = ['flatpak', 'remote-ls', '--updates']
+    upgrade = ['flatpak', 'update']
+    cleanup = ['flatpak', 'uninstall', '--unused']
+    no_updates_output = ''
+    requires = 'flatpak'
+    default = true
+
+Plugins
+-------
+
+Every *.py file in ${XDG_CONFIG_HOME:-~/.config}/update-sw/updaters/ is
+loaded, in sorted order, after the built-in and config-defined updaters.
+This script is importable from them as `update_sw`, and subclassing Updater
+(or CommandBasedUpdater) registers the new updater by its `name`.  A plugin
+that fails to load is reported and skipped.  Plugin updaters are part of the
+default list, after the built-in ones, when they apply and are available;
+set `default = False` to run one only by name.  For example:
+
+    from update_sw import CommandBasedUpdater
+
+    class SnapUpdater(CommandBasedUpdater):
+        name = 'snap'
+        requires = 'snap'
+        outdated_cmd = ('snap', 'refresh', '--list')
+        upgrade_cmd = ('sudo', 'snap', 'refresh')
+
+        def has_updates(self, output):
+            return 'All snaps up to date' not in output
+"""
+
 import argparse
 import getpass
+import importlib.util
 import json
 import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from functools import cache, cached_property
 from io import StringIO
 from pathlib import Path
-from typing import TextIO, cast
+from typing import Any, TextIO, TypeVar, cast
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None  # type: ignore
 
 from tabulate import tabulate
+
+T = TypeVar('T')
 
 
 def create_parser():
@@ -44,6 +122,36 @@ def create_parser():
         help='skip running update command',
     )
     parser.add_argument(
+        '-c',
+        '--config',
+        type=Path,
+        help='config file to use '
+        '[default: ${XDG_CONFIG_HOME:-~/.config}/update-sw/config.toml]',
+    )
+    parser.add_argument(
+        '-x',
+        '--exclude',
+        action='append',
+        default=[],
+        metavar='NAME',
+        help='do not run this updater, repeat for more than one',
+    )
+    parser.add_argument(
+        '-y',
+        '--yes',
+        action='store_true',
+        help='answer yes to every [Y/n] prompt (and pick the default '
+        'target when moving virtualenvs) instead of asking',
+    )
+    parser.add_argument(
+        '-n',
+        '--dry-run',
+        action='store_true',
+        help='print "would run: ..." instead of running commands that change '
+        'anything (update, upgrade, cleanup, update-python, update-venv); '
+        'read-only queries (outdated, pip list, pyenv versions) still run',
+    )
+    parser.add_argument(
         '--list',
         action='store_true',
         help='list known updater names and exit',
@@ -57,11 +165,11 @@ def create_parser():
     return parser
 
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     """Parse command line arguments."""
 
     parser = create_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     return args
 
@@ -81,6 +189,141 @@ def configure_logging(args, use_stdout=False):
     logging.debug(args)
 
 
+@dataclass
+class Settings:
+    """Run-wide switches, set once from the command line."""
+
+    yes: bool = False
+    dry_run: bool = False
+
+
+# A plain module-level setting: threading it through every updater would only
+# add arguments that nothing but confirm() and _run() ever look at.
+SETTINGS = Settings()
+
+
+def confirm(prompt: str) -> bool:
+    """Ask a yes-by-default question; only an explicit n/N says no."""
+
+    if SETTINGS.yes:
+        # Echo the answer so a log of an unattended run still reads sensibly.
+        print(f'{prompt}y')
+        return True
+    return input(prompt) not in ('N', 'n')
+
+
+class UpdaterError(Exception):
+    """One or more items of an updater failed (and were already reported)."""
+
+    def __init__(self, failed: Sequence[str]):
+        super().__init__(f'failed: {", ".join(failed)}')
+        self.failed = list(failed)
+
+
+def run_each(
+    items: Iterable[T],
+    fn: Callable[[T], object],
+    label_of: Callable[[T], str],
+    catch: tuple[type[Exception], ...] = (subprocess.CalledProcessError,),
+) -> None:
+    """Call fn on every item, then raise UpdaterError if any of them failed.
+
+    One bad item should not cost the user the others, so each failure is
+    reported as it happens and only raised once everything has had its turn.
+    """
+
+    failed: list[str] = []
+    for item in items:
+        try:
+            fn(item)
+        except catch as ex:
+            label = label_of(item)
+            print(f'{label}: {ex}', file=sys.stderr)
+            failed.append(label)
+    if failed:
+        raise UpdaterError(failed)
+
+
+# Platform facts.  Cached because they cannot change mid-run and several
+# updaters ask.
+
+
+@cache
+def is_darwin() -> bool:
+    return platform.system() == 'Darwin'
+
+
+@cache
+def linux_distro() -> str:
+    """The distro id (`ubuntu`, `gentoo`, ...), or '' if not on Linux."""
+
+    if platform.system() != 'Linux':
+        return ''
+    try:
+        import distro  # type: ignore
+    except ImportError:
+        return ''
+    return distro.id()
+
+
+@cache
+def is_wsl() -> bool:
+    return (
+        platform.system() == 'Linux'
+        and 'microsoft-standard-WSL' in platform.uname().release
+    )
+
+
+@cache
+def command_succeeds(*args: str) -> bool:
+    """Whether running `args` works, i.e. the tool is installed and sane."""
+
+    try:
+        subprocess.run(
+            args,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+# name -> class for every concrete Updater, filled in as classes are defined.
+REGISTRY: dict[str, type['Updater']] = {}
+
+# The order updaters run in, wherever they apply.  Updaters that are not
+# listed (from config or plugins) run after these, in registration order.
+ORDER: list[str] = [
+    'windows-update',
+    'windows-store',
+    'macos',
+    'brew',
+    # After brew, which is what installs and upgrades mas itself.
+    'mas',
+    'apt',
+    'emerge',
+    'pip',
+    'pyenv',
+    # After pyenv, so a virtualenv whose base was just upgraded is already
+    # dealt with and only genuine stragglers are left to report.
+    'venv',
+    'rustup',
+    # After rustup, so anything rebuilt from source uses the toolchain that
+    # was just updated.
+    'cargo',
+]
+
+
+def list_names() -> list[str]:
+    """Every registered updater name, in ORDER and then registration order."""
+
+    return [n for n in ORDER if n in REGISTRY] + [
+        n for n in REGISTRY if n not in ORDER
+    ]
+
+
 # Runs roughly the following commands:
 #   brew update
 #   brew outdated
@@ -91,15 +334,71 @@ def configure_logging(args, use_stdout=False):
 #   pip3 check | cut -d ' ' -f1 | xargs pip3 install
 
 
-class Updater(ABC):
-    @staticmethod
-    def _run(args: Sequence[str]):
-        logging.debug(args)
-        subprocess.run(args, check=True)
+class Updater:
+    """Base class for everything update-sw can update.
 
-    @property
-    def name(self) -> str:
-        raise NotImplementedError
+    Subclasses are registered by `name` when defined.  Implement any of
+    _update, _outdated, _upgrade and _cleanup; the ones left alone are
+    skipped silently.  Set `abstract = True` on a class that only exists to
+    be subclassed.
+    """
+
+    name: str = ''
+    # Whether the default set includes this updater (when it applies and is
+    # available); it can always be requested by name.
+    default = True
+    # What the outdated step found, for has_updates-style decisions.
+    outdated_output: str = ''
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Looked up in the class's own namespace so that `abstract` is not
+        # inherited: a subclass of an abstract helper is concrete.
+        if cls.__dict__.get('abstract', False):
+            return
+        if not cls.name:
+            raise ValueError(f'{cls.__name__} has no name')
+        if cls.name in REGISTRY:
+            raise ValueError(f'updater {cls.name!r} is already registered')
+        REGISTRY[cls.name] = cls
+
+    @classmethod
+    def from_args(
+        cls, args: argparse.Namespace, config: dict[str, Any]
+    ) -> 'Updater':
+        """Build an updater from the command line and its config section."""
+
+        return cls()
+
+    @classmethod
+    def applies(cls) -> bool:
+        """Whether this updater makes sense on this platform at all."""
+
+        return True
+
+    @classmethod
+    def available(cls) -> bool:
+        """Whether what this updater drives is installed and usable."""
+
+        return True
+
+    @classmethod
+    def missing_hint(cls) -> str | None:
+        """Say what is missing, or None if this updater can run."""
+
+        if cls.available():
+            return None
+        return f'{cls.name} is not available on this system.'
+
+    @staticmethod
+    def _run(args: Sequence[str], check: bool = True):
+        """Run a command that changes things, so honor --dry-run."""
+
+        if SETTINGS.dry_run:
+            print(f'would run: {shlex.join(args)}')
+            return
+        logging.debug(args)
+        subprocess.run(args, check=check)
 
     @property
     def update_banner(self) -> str:
@@ -117,44 +416,65 @@ class Updater(ABC):
     def cleanup_banner(self) -> str:
         return f'Running cleanup ({self.name})...'
 
-    @abstractmethod
     def _update(self):
-        raise NotImplementedError
+        """Refresh package metadata."""
 
-    @abstractmethod
     def _outdated(self):
-        raise NotImplementedError
+        """Show what is out of date."""
 
-    @abstractmethod
     def _upgrade(self):
-        raise NotImplementedError
+        """Install what is out of date."""
 
-    @abstractmethod
     def _cleanup(self):
-        raise NotImplementedError
+        """Remove what is no longer needed."""
+
+    def _has_step(self, step: str) -> bool:
+        """Whether this updater implements `step` (update, outdated, ...)."""
+
+        method = f'_{step}'
+        return getattr(type(self), method) is not getattr(Updater, method)
+
+    def _wants_upgrade(self) -> bool:
+        """Whether the outdated step found anything worth asking about."""
+
+        return True
 
     def update(self):
+        if not self._has_step('update'):
+            return
         print(self.update_banner)
         self._update()
         print()
 
     def outdated(self):
+        if not self._has_step('outdated'):
+            return
         print(self.outdated_banner)
         self._outdated()
         print()
 
     def upgrade(self):
-        reply = input(self.upgrade_prompt)
-        if reply not in ('N', 'n'):
+        if not self._has_step('upgrade') or not self._wants_upgrade():
+            return
+        if confirm(self.upgrade_prompt):
             self._upgrade()
         print()
 
     def cleanup(self):
+        if not self._has_step('cleanup'):
+            return
         print(self.cleanup_banner)
         self._cleanup()
         print()
 
     def run(self, skip_update: bool = False):
+        if not self.available():
+            # Reached when the user asked for this updater by name; the
+            # default set leaves out anything that is not available.
+            print(self.outdated_banner)
+            print(self.missing_hint())
+            print()
+            return
         if not skip_update:
             self.update()
         self.outdated()
@@ -163,6 +483,26 @@ class Updater(ABC):
 
 
 class CommandBasedUpdater(Updater):
+    """An updater driven by plain commands, set as class attributes.
+
+    Each *_cmd is a tuple of arguments; the default `()` means the updater
+    has no such step.
+    """
+
+    abstract = True
+
+    update_cmd: tuple[str, ...] = ()
+    outdated_cmd: tuple[str, ...] = ()
+    upgrade_cmd: tuple[str, ...] = ()
+    cleanup_cmd: tuple[str, ...] = ()
+    # Exit codes of outdated_cmd, besides 0, that are not failures.
+    outdated_ok_returncodes: tuple[int, ...] = ()
+    # Whether a failing update_cmd stops this updater, or is reported and
+    # the rest of its steps still run.
+    update_is_fatal: bool = True
+    # An executable that must be on PATH for this updater to be available.
+    requires: str | None = None
+
     @staticmethod
     def _run_with_output(args: Sequence[str], allowed_returncodes=()) -> str:
         with (
@@ -184,36 +524,43 @@ class CommandBasedUpdater(Updater):
                 raise subprocess.CalledProcessError(p.returncode, args, output)
             return output
 
-    @property
-    @abstractmethod
-    def update_cmd(self) -> tuple[str, ...]:
-        raise NotImplementedError
+    @classmethod
+    def available(cls) -> bool:
+        return cls.requires is None or shutil.which(cls.requires) is not None
 
-    @property
-    @abstractmethod
-    def outdated_cmd(self) -> tuple[str, ...]:
-        raise NotImplementedError
-
-    @property
-    def has_updates(self) -> bool:
-        # Override and parse self.outdated_output to skip upgrade
+    def has_updates(self, output: str) -> bool:
+        # Override and parse the outdated output to skip upgrade
         return True
 
-    @property
-    @abstractmethod
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        raise NotImplementedError
+    def _has_step(self, step: str) -> bool:
+        # A subclass that implements the step itself (PyenvUpdater has no
+        # single outdated_cmd to run) always has it; otherwise it has it
+        # exactly when there is a command to run.
+        method = f'_{step}'
+        if getattr(type(self), method) is not getattr(
+            CommandBasedUpdater, method
+        ):
+            return True
+        return bool(getattr(self, f'{step}_cmd'))
 
-    @property
-    @abstractmethod
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        raise NotImplementedError
+    def _wants_upgrade(self) -> bool:
+        return self.has_updates(self.outdated_output)
 
     def _update(self):
-        self._run(self.update_cmd)
+        try:
+            self._run(self.update_cmd)
+        except subprocess.CalledProcessError as ex:
+            if self.update_is_fatal:
+                raise
+            print(
+                f'{self.name}: update failed ({ex}); continuing',
+                file=sys.stderr,
+            )
 
     def _outdated(self):
-        self.outdated_output = self._run_with_output(self.outdated_cmd)
+        self.outdated_output = self._run_with_output(
+            self.outdated_cmd, self.outdated_ok_returncodes
+        )
 
     def _upgrade(self):
         self._run(self.upgrade_cmd)
@@ -221,110 +568,71 @@ class CommandBasedUpdater(Updater):
     def _cleanup(self):
         self._run(self.cleanup_cmd)
 
-    def update(self):
-        if not self.update_cmd:
-            return
-        super().update()
-
-    def outdated(self):
-        if not self.outdated_cmd:
-            return
-        super().outdated()
-
-    def upgrade(self):
-        if not self.upgrade_cmd:
-            return
-        if self.has_updates:
-            super().upgrade()
-
-    def cleanup(self):
-        if not self.cleanup_cmd:
-            return
-        super().cleanup()
-
 
 class BrewUpdater(CommandBasedUpdater):
-    @property
-    def name(self) -> str:
-        return 'brew'
+    name = 'brew'
+    update_cmd = ('brew', 'update')
+    outdated_cmd = ('brew', 'outdated')
+    upgrade_cmd = ('brew', 'upgrade', '--yes')
+    cleanup_cmd = ('brew', 'cleanup')
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'update')
+    def __init__(self, fetch_head: bool = True):
+        if fetch_head:
+            self.outdated_cmd = (*self.outdated_cmd, '--fetch-HEAD')
+            self.upgrade_cmd = (*self.upgrade_cmd, '--fetch-HEAD')
 
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'outdated', '--fetch-HEAD')
+    @classmethod
+    def applies(cls) -> bool:
+        return is_darwin()
 
-    @property
-    def has_updates(self) -> bool:
-        return self.outdated_output != ''
+    @classmethod
+    def from_args(cls, args, config):
+        return cls(fetch_head=config_get(config, 'fetch_head', bool, True))
 
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'upgrade', '--yes', '--fetch-HEAD')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ('brew', 'cleanup')
+    def has_updates(self, output: str) -> bool:
+        return output != ''
 
 
 class AptUpdater(CommandBasedUpdater):
-    @property
-    def name(self) -> str:
-        return 'apt'
+    name = 'apt'
+    update_cmd = ('sudo', '/usr/bin/apt', 'update')
+    outdated_cmd = ('/usr/bin/apt', 'list', '--upgradeable')
+    upgrade_cmd = ('sudo', '/usr/bin/apt', 'upgrade')
+    cleanup_cmd = ('sudo', '/usr/bin/apt', 'autoremove')
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/apt', 'update')
+    @classmethod
+    def applies(cls) -> bool:
+        return linux_distro() in ('ubuntu', 'raspbian', 'debian')
 
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ('/usr/bin/apt', 'list', '--upgradeable')
-
-    @property
-    def has_updates(self) -> bool:
-        return self.outdated_output != 'Listing...\n'
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/apt', 'upgrade')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/apt', 'autoremove')
+    def has_updates(self, output: str) -> bool:
+        return output != 'Listing...\n'
 
 
 class EmergeUpdater(CommandBasedUpdater):
-    @property
-    def name(self) -> str:
-        return 'emerge'
+    name = 'emerge'
+    update_cmd = ('sudo', '/usr/bin/nice', '/usr/bin/eix-sync')
+    upgrade_cmd = (
+        'ntfy',
+        'done',
+        '-L',
+        '60',
+        'sudo',
+        '/usr/bin/nice',
+        '/usr/bin/emerge',
+        '-avuUD',
+        '@world',
+    )
+    cleanup_cmd = (
+        'sudo',
+        '/usr/bin/nice',
+        '/usr/bin/emerge',
+        '-av',
+        '--depclean',
+    )
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/nice', '/usr/bin/eix-sync')
-
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return (
-            'ntfy',
-            'done',
-            '-L',
-            '60',
-            'sudo',
-            '/usr/bin/nice',
-            '/usr/bin/emerge',
-            '-avuUD',
-            '@world',
-        )
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ('sudo', '/usr/bin/nice', '/usr/bin/emerge', '-av', '--depclean')
+    @classmethod
+    def applies(cls) -> bool:
+        return linux_distro() == 'gentoo'
 
 
 CPYTHON_RE = re.compile(r'(\d+)\.(\d+)\.(\d+)')
@@ -424,19 +732,25 @@ def pyenv_installed_versions() -> list[str]:
 
 
 class SinglePipUpdater(Updater):
+    abstract = True  # Built by PipUpdater, once per environment.
+
     PIP_SKIP = ('inventory', 'utils')
 
-    def __init__(self, pip_path: str | Path, label: str | None = None):
+    def __init__(
+        self,
+        pip_path: str | Path,
+        label: str | None = None,
+        skip: Iterable[str] | None = None,
+    ):
         resolved = shutil.which(pip_path)
         if resolved is None:
             raise FileNotFoundError(f'no executable pip at {pip_path}')
         self.pip: str = resolved
-        self._label = label
+        # Not a class attribute like every registered updater's name: it says
+        # which environment this instance is for.
+        self.name = f'pip ({label})' if label else 'pip'
+        self.skip = tuple(self.PIP_SKIP if skip is None else skip)
         self._to_update: list[str] = []
-
-    @property
-    def name(self) -> str:
-        return f'pip ({self._label})' if self._label else 'pip'
 
     def run(self, skip_update: bool = False):
         owner = Path(self.pip).owner()
@@ -446,22 +760,8 @@ class SinglePipUpdater(Updater):
             return
         super().run(skip_update)
 
-    def update(self):
-        pass
-
-    def cleanup(self):
-        pass
-
-    def _update(self):
-        pass
-
-    def _cleanup(self):
-        pass
-
-    def upgrade(self):
-        if not self._to_update:
-            return
-        super().upgrade()
+    def _wants_upgrade(self) -> bool:
+        return bool(self._to_update)
 
     def _outdated(self):
         outdated = json.loads(
@@ -475,7 +775,7 @@ class SinglePipUpdater(Updater):
         to_update = []
         for package in outdated:
             name = package['name']
-            if name in self.PIP_SKIP:
+            if name in self.skip:
                 print('Skipping {name}'.format_map(package))
             else:
                 to_update.append(
@@ -494,10 +794,11 @@ class SinglePipUpdater(Updater):
     def _upgrade(self):
         if not self._to_update:
             return
-        logging.debug([self.pip, 'install', '-U'] + self._to_update)
-        subprocess.run(
-            [self.pip, 'install', '-U'] + self._to_update, check=True
-        )
+        self._run([self.pip, 'install', '-U'] + self._to_update)
+        if SETTINGS.dry_run:
+            # Nothing was installed, so `pip check` would only report the
+            # state before the upgrade.
+            return
         result = subprocess.run(
             (str(self.pip), 'check'),
             stdout=subprocess.PIPE,
@@ -510,7 +811,7 @@ class SinglePipUpdater(Updater):
             ]
             print('Fixing broken pip dependencies')
             print(f'{self.pip} install {" ".join(to_fix)}')
-            subprocess.run([self.pip, 'install'] + to_fix, check=True)
+            self._run([self.pip, 'install'] + to_fix)
 
 
 @dataclass(frozen=True)
@@ -525,24 +826,16 @@ class PyenvUpgrade:
 
 
 class PyenvUpdater(CommandBasedUpdater):
+    name = 'pyenv'
+
     def __init__(self):
         self._upgrades: list[PyenvUpgrade] = []
 
-    @property
-    def name(self) -> str:
-        return 'pyenv'
+    @classmethod
+    def available(cls) -> bool:
+        return command_succeeds('pyenv', '--version')
 
-    @staticmethod
-    def has_pyenv() -> bool:
-        try:
-            subprocess.run(
-                ('pyenv', '--version'), check=True, stdout=subprocess.DEVNULL
-            )
-            return True
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            return False
-
-    @property
+    @cached_property
     def has_update(self) -> bool:
         """Determines if pyenv update command is available"""
         commands = subprocess.run(
@@ -558,17 +851,6 @@ class PyenvUpdater(CommandBasedUpdater):
         if not self.has_update:
             return ()
         return ('pyenv', 'update')
-
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    def outdated(self):
-        # Bypasses CommandBasedUpdater.outdated(), which would skip the check
-        # entirely because there is no single `outdated_cmd` to run for it.
-        print(self.outdated_banner)
-        self._outdated()
-        print()
 
     def _venvs_on(self, base: str) -> list[str]:
         try:
@@ -629,8 +911,7 @@ class PyenvUpdater(CommandBasedUpdater):
                 continue
             if newest.release > current.release:
                 print(
-                    f'{current.series_name}: '
-                    f'{current.name} -> {newest.name}'
+                    f'{current.series_name}: {current.name} -> {newest.name}'
                 )
                 self._upgrades.append(PyenvUpgrade(current.name, newest.name))
             else:
@@ -652,58 +933,44 @@ class PyenvUpdater(CommandBasedUpdater):
                 PyenvUpgrade(source, newest.name, new_series=True)
             )
 
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ()
+    def _upgrade_one(self, upgrade: PyenvUpgrade):
+        if upgrade.new_series:
+            prompt = (
+                f'Install new series ({self.name}: {upgrade.new}), '
+                f'migrating from {upgrade.old}? [Y/n]: '
+            )
+        else:
+            prompt = (
+                f'Run upgrade ({self.name}: '
+                f'{upgrade.old} -> {upgrade.new})? [Y/n]: '
+            )
+        if not confirm(prompt):
+            return
+
+        cmd = ['update-python']
+        # Only a within-series upgrade retires the old version, so only
+        # then is it safe to move its virtualenvs across; a new series
+        # leaves the old one installed and still in use.
+        if not upgrade.new_series:
+            venvs = self._venvs_on(upgrade.old)
+            if venvs and confirm(
+                f'Migrate {len(venvs)} virtualenv(s) on {upgrade.old} '
+                f'({", ".join(venvs)}) to {upgrade.new}? [Y/n]: '
+            ):
+                cmd.append('--migrate-venvs')
+        cmd += [upgrade.new, upgrade.old]
+
+        self._run(tuple(cmd))
 
     def upgrade(self):
         if not self._upgrades:
             return
 
-        first_error: subprocess.CalledProcessError | None = None
-        for upgrade in self._upgrades:
-            if upgrade.new_series:
-                prompt = (
-                    f'Install new series ({self.name}: {upgrade.new}), '
-                    f'migrating from {upgrade.old}? [Y/n]: '
-                )
-            else:
-                prompt = (
-                    f'Run upgrade ({self.name}: '
-                    f'{upgrade.old} -> {upgrade.new})? [Y/n]: '
-                )
-            if input(prompt) in ('N', 'n'):
-                continue
-
-            cmd = ['update-python']
-            # Only a within-series upgrade retires the old version, so only
-            # then is it safe to move its virtualenvs across; a new series
-            # leaves the old one installed and still in use.
-            if not upgrade.new_series:
-                venvs = self._venvs_on(upgrade.old)
-                if venvs:
-                    venv_reply = input(
-                        f'Migrate {len(venvs)} virtualenv(s) on {upgrade.old} '
-                        f'({", ".join(venvs)}) to {upgrade.new}? [Y/n]: '
-                    )
-                    if venv_reply not in ('N', 'n'):
-                        cmd.append('--migrate-venvs')
-            cmd += [upgrade.new, upgrade.old]
-
-            # One failed version should not cost the user the others.
-            try:
-                self._run(tuple(cmd))
-            except subprocess.CalledProcessError as ex:
-                print(f'{upgrade.new}: {ex}', file=sys.stderr)
-                first_error = first_error or ex
-        print()
-
-        if first_error is not None:
-            raise first_error
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
+        # One failed version should not cost the user the others.
+        try:
+            run_each(self._upgrades, self._upgrade_one, lambda u: u.new)
+        finally:
+            print()
 
 
 @dataclass(frozen=True)
@@ -724,35 +991,18 @@ class VenvUpdater(Updater):
     upgraded -- stays behind indefinitely. This finds those.
     """
 
+    name = 'venv'
+
     def __init__(self):
         self._moves: list[VenvMove] = []
 
-    @property
-    def name(self) -> str:
-        return 'venv'
-
-    @staticmethod
-    def has_virtualenv() -> bool:
+    @classmethod
+    def available(cls) -> bool:
         try:
             commands = _pyenv_lines(('pyenv', 'commands'))
         except (FileNotFoundError, subprocess.CalledProcessError, OSError):
             return False
         return 'virtualenvs' in (command.strip() for command in commands)
-
-    def _update(self):
-        pass
-
-    def _upgrade(self):
-        pass
-
-    def _cleanup(self):
-        pass
-
-    def update(self):
-        pass
-
-    def cleanup(self):
-        pass
 
     def _outdated(self):
         installed = latest_per_series(
@@ -793,25 +1043,21 @@ class VenvUpdater(Updater):
                 print(f'{name}: on {base}')
                 self._moves.append(move)
 
+    def _upgrade_one(self, move: VenvMove):
+        target = self._choose_target(move)
+        if target is None:
+            return
+        self._run(('update-venv', '--to', target, move.name))
+
     def upgrade(self):
         if not self._moves:
             return
 
-        first_error: subprocess.CalledProcessError | None = None
-        for move in self._moves:
-            target = self._choose_target(move)
-            if target is None:
-                continue
-            # One failed virtualenv should not cost the user the others.
-            try:
-                self._run(('update-venv', '--to', target, move.name))
-            except subprocess.CalledProcessError as ex:
-                print(f'{move.name}: {ex}', file=sys.stderr)
-                first_error = first_error or ex
-        print()
-
-        if first_error is not None:
-            raise first_error
+        # One failed virtualenv should not cost the user the others.
+        try:
+            run_each(self._moves, self._upgrade_one, lambda m: m.name)
+        finally:
+            print()
 
     @staticmethod
     def _choose_target(move: VenvMove) -> str | None:
@@ -827,11 +1073,12 @@ class VenvUpdater(Updater):
         ]
         if len(options) == 1:
             target, label = options[0]
-            reply = input(
+            if confirm(
                 f'Move {move.name} from {move.base} to {target} '
                 f'({label})? [Y/n]: '
-            )
-            return None if reply in ('N', 'n') else target
+            ):
+                return target
+            return None
 
         print(f'{move.name} is on {move.base}:')
         for number, (target, label) in enumerate(options, start=1):
@@ -839,7 +1086,12 @@ class VenvUpdater(Updater):
         choices = '/'.join(
             str(number) for number in range(1, len(options) + 1)
         )
-        reply = input(f'Move {move.name}? [{choices}/n]: ').strip()
+        prompt = f'Move {move.name}? [{choices}/n]: '
+        if SETTINGS.yes:
+            # The first option is also what an empty reply picks.
+            print(f'{prompt}1')
+            return options[0][0]
+        reply = input(prompt).strip()
         if reply in ('N', 'n'):
             return None
         if not reply:
@@ -853,18 +1105,26 @@ class VenvUpdater(Updater):
 class PipUpdater(Updater):
     """Runs the pip updater against every pyenv environment we own."""
 
-    def __init__(self, pip_bin: str | None = None):
-        self.pip_bin = pip_bin
+    name = 'pip'
 
-    @property
-    def name(self) -> str:
-        return 'pip'
+    def __init__(
+        self,
+        pip_bin: str | None = None,
+        skip: Iterable[str] | None = None,
+    ):
+        self.pip_bin = pip_bin
+        self.skip = skip
+
+    @classmethod
+    def from_args(cls, args, config):
+        skip = config_get(config, 'skip', list, None)
+        return cls(args.pip_bin, skip=skip)
 
     def _target_pips(self) -> list[tuple[str, str | None]]:
         if self.pip_bin:
             return [(self.pip_bin, None)]
 
-        if PyenvUpdater.has_pyenv():
+        if PyenvUpdater.available():
             root = subprocess.run(
                 ('pyenv', 'root'),
                 check=True,
@@ -889,171 +1149,80 @@ class PipUpdater(Updater):
             print('No pip targets found')
             return
 
-        failed = False
-        first_error: subprocess.CalledProcessError | None = None
-        for path, label in targets:
-            # Keep going: one broken environment -- a pip too old to speak
-            # `--format json`, a half-removed prefix -- should not cost the
-            # user every other environment queued behind it.
-            try:
-                SinglePipUpdater(path, label).run(skip_update)
-            except subprocess.CalledProcessError as ex:
-                print(f'{label or path}: {ex}', file=sys.stderr)
-                first_error = first_error or ex
-                failed = True
-            except (json.JSONDecodeError, OSError) as ex:
-                print(f'{label or path}: {ex}', file=sys.stderr)
-                failed = True
-
-        if first_error is not None:
-            raise first_error
-        if failed:
-            raise subprocess.CalledProcessError(1, ('pip',))
-
-    def _update(self):
-        pass
-
-    def _outdated(self):
-        pass
-
-    def _upgrade(self):
-        pass
-
-    def _cleanup(self):
-        pass
+        # Keep going: one broken environment -- a pip too old to speak
+        # `--format json`, a half-removed prefix -- should not cost the
+        # user every other environment queued behind it.
+        run_each(
+            targets,
+            lambda target: SinglePipUpdater(
+                target[0], target[1], self.skip
+            ).run(skip_update),
+            lambda target: target[1] or target[0],
+            catch=(
+                subprocess.CalledProcessError,
+                json.JSONDecodeError,
+                OSError,
+            ),
+        )
 
 
 class MacOsUpdater(CommandBasedUpdater):
-    @property
-    def name(self) -> str:
-        return 'macos'
+    name = 'macos'
+    outdated_cmd = ('softwareupdate', '--list')
+    upgrade_cmd = ('sudo', 'softwareupdate', '--install', '--all', '--restart')
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ()
+    @classmethod
+    def applies(cls) -> bool:
+        return is_darwin()
 
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ('softwareupdate', '--list')
-
-    @property
-    def has_updates(self) -> bool:
-        return not self.outdated_output.endswith('Finding available software\n')
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('sudo', 'softwareupdate', '--install', '--all', '--restart')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
+    def has_updates(self, output: str) -> bool:
+        return not output.endswith('Finding available software\n')
 
 
 class MasUpdater(CommandBasedUpdater):
     """Updates Mac App Store apps with the `mas` command line tool."""
 
-    @staticmethod
-    def has_mas() -> bool:
-        return shutil.which('mas') is not None
+    name = 'mas'
+    requires = 'mas'
+    # `mas outdated` queries the App Store itself, so there is no update_cmd.
+    # --accurate is slower, but the default check misses some updates.
+    outdated_cmd = ('mas', 'outdated', '--accurate')
+    # mas needs root to install app updates.
+    upgrade_cmd = ('sudo', 'mas', 'upgrade', '--accurate')
 
-    @property
-    def name(self) -> str:
-        return 'mas'
+    @classmethod
+    def applies(cls) -> bool:
+        return is_darwin()
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        # `mas outdated` queries the App Store itself.
-        return ()
+    @classmethod
+    def missing_hint(cls) -> str | None:
+        if cls.available():
+            return None
+        return 'mas is not installed.\nInstall it with: brew install mas'
 
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        # --accurate is slower, but the default check misses some updates.
-        return ('mas', 'outdated', '--accurate')
-
-    @property
-    def has_updates(self) -> bool:
-        return self.outdated_output.strip() != ''
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        # mas needs root to install app updates.
-        return ('sudo', 'mas', 'upgrade', '--accurate')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    def outdated(self):
-        # Reached when the user asked for this updater by name; the default
-        # set leaves it out unless mas is installed.
-        if not self.has_mas():
-            print(self.outdated_banner)
-            print('mas is not installed.\nInstall it with: brew install mas')
-            print()
-            self.outdated_output = ''
-            return
-        super().outdated()
+    def has_updates(self, output: str) -> bool:
+        return output.strip() != ''
 
 
 class RustupUpdater(CommandBasedUpdater):
-    @staticmethod
-    def has_rustup() -> bool:
-        try:
-            subprocess.run(
-                ('rustup', '--version'),
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            return False
+    name = 'rustup'
+    # Self update is disabled in package-manager builds and may fail
+    # transiently; neither should block the toolchain update.
+    update_cmd = ('rustup', 'self', 'update')
+    update_is_fatal = False
+    outdated_cmd = ('rustup', 'check')
+    # `rustup check` exits 100 when an update is available.
+    outdated_ok_returncodes = (100,)
+    # Self update was already attempted (or skipped via --skip-update)
+    # in the update step, so don't try it again.
+    upgrade_cmd = ('rustup', 'update', '--no-self-update')
 
-    @property
-    def name(self) -> str:
-        return 'rustup'
+    @classmethod
+    def available(cls) -> bool:
+        return command_succeeds('rustup', '--version')
 
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        return ('rustup', 'self', 'update')
-
-    def _update(self):
-        # Self update is disabled in package-manager builds and may fail
-        # transiently; neither should block the toolchain update.
-        try:
-            self._run(self.update_cmd)
-        except subprocess.CalledProcessError as ex:
-            print(
-                f'{self.name}: self update failed ({ex}); '
-                'continuing with toolchain update',
-                file=sys.stderr,
-            )
-
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        return ('rustup', 'check')
-
-    def _outdated(self):
-        self.outdated_output = self._run_with_output(
-            self.outdated_cmd, allowed_returncodes=(100,)
-        )
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        # Self update was already attempted (or skipped via --skip-update)
-        # in the update step, so don't try it again.
-        return ('rustup', 'update', '--no-self-update')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    @property
-    def has_updates(self) -> bool:
-        return (
-            re.search('Update available', self.outdated_output, re.IGNORECASE)
-            is not None
-        )
+    def has_updates(self, output: str) -> bool:
+        return re.search('Update available', output, re.IGNORECASE) is not None
 
 
 class CargoUpdater(CommandBasedUpdater):
@@ -1063,6 +1232,25 @@ class CargoUpdater(CommandBasedUpdater):
     both halves of this are left to cargo-update, the subcommand that exists
     for exactly that.
     """
+
+    name = 'cargo'
+    # `install-update --list` polls the registry itself, so there is no
+    # update_cmd.
+    outdated_cmd = ('cargo', 'install-update', '--list', '--all')
+    upgrade_cmd = ('cargo', 'install-update', '--all')
+
+    def __init__(self, git: bool = True):
+        # cargo-update leaves --git off by default because re-fetching every
+        # git package is slow, but without it those packages are never
+        # reported and so never updated -- the same trade brew makes here
+        # with --fetch-HEAD.
+        if git:
+            self.outdated_cmd = (*self.outdated_cmd, '--git')
+            self.upgrade_cmd = (*self.upgrade_cmd, '--git')
+
+    @classmethod
+    def from_args(cls, args, config):
+        return cls(git=config_get(config, 'git', bool, True))
 
     @staticmethod
     def cargo_bin_dir() -> Path:
@@ -1084,7 +1272,12 @@ class CargoUpdater(CommandBasedUpdater):
         return os.access(binary, os.X_OK)
 
     @classmethod
-    def missing_tool_hint(cls) -> str | None:
+    def available(cls) -> bool:
+        # Only worth queueing if cargo-update can do the check.
+        return cls.has_cargo_update()
+
+    @classmethod
+    def missing_hint(cls) -> str | None:
         """Say what to install, or None if this updater can run."""
 
         if not cls.has_cargo():
@@ -1097,211 +1290,337 @@ class CargoUpdater(CommandBasedUpdater):
             )
         return None
 
-    @property
-    def name(self) -> str:
-        return 'cargo'
-
-    @property
-    def update_cmd(self) -> tuple[str, ...]:
-        # `install-update --list` polls the registry itself.
-        return ()
-
-    @property
-    def outdated_cmd(self) -> tuple[str, ...]:
-        # cargo-update leaves --git off by default because re-fetching every
-        # git package is slow, but without it those packages are never
-        # reported and so never updated -- the same trade brew makes here
-        # with --fetch-HEAD.
-        return ('cargo', 'install-update', '--list', '--all', '--git')
-
-    @property
-    def upgrade_cmd(self) -> tuple[str, ...]:
-        return ('cargo', 'install-update', '--all', '--git')
-
-    @property
-    def cleanup_cmd(self) -> tuple[str, ...]:
-        return ()
-
-    @property
-    def has_updates(self) -> bool:
+    def has_updates(self, output: str) -> bool:
         # Every package row ends in Yes or No, and the table header's last
         # field is 'update', so matching the final field is enough.
         return any(
             fields[-1] == 'Yes'
-            for fields in (
-                line.split() for line in self.outdated_output.splitlines()
-            )
+            for fields in (line.split() for line in output.splitlines())
             if fields
         )
-
-    def outdated(self):
-        # Reached when the user asked for this updater by name; the default
-        # set leaves it out unless cargo-update is installed.
-        hint = self.missing_tool_hint()
-        if hint is not None:
-            print(self.outdated_banner)
-            print(hint)
-            print()
-            self.outdated_output = ''
-            return
-        super().outdated()
 
 
 class ExplorerUpdater(Updater):
     """Base for Windows updaters that just open a settings pane via explorer.exe."""
 
+    abstract = True
+
     uri: str
 
+    @classmethod
+    def applies(cls) -> bool:
+        return is_wsl()
+
     def _update(self):
-        subprocess.run(['explorer.exe', self.uri])
-
-    def _outdated(self):
-        pass
-
-    def _upgrade(self):
-        pass
-
-    def _cleanup(self):
-        pass
-
-    def outdated(self):
-        pass
-
-    def upgrade(self):
-        pass
-
-    def cleanup(self):
-        pass
+        self._run(['explorer.exe', self.uri], check=False)
 
 
 class WindowsUpdateUpdater(ExplorerUpdater):
+    name = 'windows-update'
     uri = 'ms-settings:windowsupdate'
-
-    @property
-    def name(self) -> str:
-        return 'windows-update'
 
 
 class WindowsStoreUpdater(ExplorerUpdater):
+    name = 'windows-store'
     uri = 'ms-windows-store:'
 
-    @property
-    def name(self) -> str:
-        return 'windows-store'
+
+class ConfigError(Exception):
+    """The config file could not be used."""
 
 
-def default_updaters() -> list[str]:
-    """Compute the ordered list of updater names to run by default on this platform."""
+def config_home() -> Path:
+    """The directory holding update-sw's config file and plugins."""
+
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    return (Path(xdg) if xdg else Path.home() / '.config') / 'update-sw'
+
+
+def load_config(path: Path | None = None) -> dict[str, Any]:
+    """Read the TOML config, or return {} if there is none to read."""
+
+    explicit = path is not None
+    if path is None:
+        path = config_home() / 'config.toml'
+    if not path.is_file():
+        if explicit:
+            raise ConfigError(f'{path}: no such file')
+        return {}
+    if tomllib is None:
+        print(
+            f'{path}: ignoring config, this Python has no tomllib (3.11+)',
+            file=sys.stderr,
+        )
+        return {}
+    # A config that does not parse is an error, not a reason to carry on with
+    # the defaults: it may be what keeps an updater from running.
+    try:
+        with path.open('rb') as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as ex:
+        raise ConfigError(f'{path}: {ex}') from ex
+
+
+def config_get(section: dict[str, Any], key: str, kind: type, default):
+    """Get section[key] if it is a `kind`, warning and defaulting if not."""
+
+    if key not in section:
+        return default
+    value = section[key]
+    if not isinstance(value, kind):
+        print(
+            f'config: {key} should be a {kind.__name__}, ignoring {value!r}',
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
+def make_command_updater(name: str, spec: dict[str, Any]) -> type[Updater]:
+    """Build (and so register) a CommandBasedUpdater subclass from data.
+
+    `spec` has the keys of a [updaters.NAME] config table.  Raises TypeError
+    if it is malformed and ValueError if `name` is taken.
+    """
+
+    known = {
+        'update',
+        'outdated',
+        'upgrade',
+        'cleanup',
+        'no_updates_output',
+        'requires',
+        'default',
+        'outdated_ok_returncodes',
+        'update_is_fatal',
+    }
+    for key in sorted(set(spec) - known):
+        print(
+            f'config: updater {name!r}: unknown key {key!r}', file=sys.stderr
+        )
+
+    def strings(key: str) -> tuple[str, ...]:
+        value = spec.get(key, ())
+        if not isinstance(value, (list, tuple)) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise TypeError(f'{key} must be a list of strings')
+        return tuple(value)
+
+    def typed(key: str, kind: type, default):
+        value = spec.get(key, default)
+        if not isinstance(value, kind):
+            raise TypeError(f'{key} must be a {kind.__name__}')
+        return value
+
+    attrs: dict[str, Any] = {
+        'name': name,
+        'update_cmd': strings('update'),
+        'outdated_cmd': strings('outdated'),
+        'upgrade_cmd': strings('upgrade'),
+        'cleanup_cmd': strings('cleanup'),
+        'update_is_fatal': typed('update_is_fatal', bool, True),
+        # Unlike built-ins, only part of the default set when asked to be.
+        'default': typed('default', bool, False),
+    }
+    returncodes = spec.get('outdated_ok_returncodes', ())
+    if not isinstance(returncodes, (list, tuple)) or not all(
+        isinstance(code, int) for code in returncodes
+    ):
+        raise TypeError('outdated_ok_returncodes must be a list of integers')
+    attrs['outdated_ok_returncodes'] = tuple(returncodes)
+    requires = spec.get('requires')
+    if requires is not None:
+        attrs['requires'] = typed('requires', str, None)
+
+    if attrs['outdated_cmd']:
+        no_updates = typed('no_updates_output', str, '').strip()
+
+        def has_updates(self, output: str) -> bool:
+            return output.strip() != no_updates
+
+        attrs['has_updates'] = has_updates
+
+    class_name = re.sub(r'\W', '_', name) + 'Updater'
+    return type(class_name, (CommandBasedUpdater,), attrs)
+
+
+def register_config_updaters(config: dict[str, Any]) -> None:
+    """Create the updaters defined under [updaters] in the config."""
+
+    section = config.get('updaters', {})
+    if not isinstance(section, dict):
+        print('config: updaters should be a table, ignoring', file=sys.stderr)
+        return
+    for name, spec in section.items():
+        if name in REGISTRY:
+            print(
+                f'config: updater {name!r} collides with a built-in '
+                'updater, skipping',
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(spec, dict):
+            print(
+                f'config: updater {name!r} should be a table, skipping',
+                file=sys.stderr,
+            )
+            continue
+        try:
+            make_command_updater(name, spec)
+        except (TypeError, ValueError) as ex:
+            print(f'config: updater {name!r}: {ex}, skipping', file=sys.stderr)
+
+
+def load_plugins(directory: Path | None = None) -> None:
+    """Import every *.py in the updaters directory, so they can register."""
+
+    if directory is None:
+        directory = config_home() / 'updaters'
+    if not directory.is_dir():
+        return
+    # Plugins import this script by this name; see the module docstring.
+    sys.modules['update_sw'] = sys.modules[__name__]
+    for path in sorted(directory.glob('*.py')):
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f'update_sw_plugin_{path.stem}', path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError('not a python module')
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+        except Exception as ex:  # noqa: BLE001 -- must not stop the rest
+            print(f'{path}: failed to load plugin: {ex!r}', file=sys.stderr)
+
+
+def known_names(names: Iterable[str], source: str) -> list[str]:
+    """Drop (with a warning) names that are not registered updaters."""
+
+    known = []
+    for name in names:
+        if name in REGISTRY:
+            known.append(name)
+        else:
+            print(
+                f'{source}: unknown updater {name!r}, ignoring',
+                file=sys.stderr,
+            )
+    return known
+
+
+def config_names(config: dict[str, Any], key: str) -> list[str]:
+    """The known updater names listed under `key` in the config."""
+
+    names = config_get(config, key, list, [])
+    if not all(isinstance(name, str) for name in names):
+        print(
+            f'config: {key} should be a list of names, ignoring',
+            file=sys.stderr,
+        )
+        return []
+    return known_names(names, f'config: {key}')
+
+
+def default_updaters(config: dict[str, Any] | None = None) -> list[str]:
+    """Compute the ordered list of updater names to run by default.
+
+    That is every updater in ORDER (then any others that were registered)
+    that applies here and is available, adjusted by the config.
+    """
+
+    config = config or {}
 
     names: list[str]
-    match platform.system():
-        case 'Darwin':
-            names = ['macos', 'brew']
-            # After brew, which is what installs and upgrades mas itself.
-            if MasUpdater.has_mas():
-                names.append('mas')
-            names.append('pip')
-        case 'Linux':
-            import distro  # type: ignore
+    if 'default' in config:
+        names = config_names(config, 'default')
+    else:
+        names = [
+            name
+            for name in list_names()
+            if REGISTRY[name].default
+            and REGISTRY[name].applies()
+            and REGISTRY[name].available()
+        ]
 
-            # If Linux, check if for ubuntu vs. gentoo.
-            match distro.id():
-                case 'gentoo':
-                    names = ['emerge', 'pip']
-                case 'rasbian':
-                    names = ['apt', 'pip']
-                case 'ubuntu':
-                    if 'microsoft-standard-WSL' in platform.uname().release:
-                        names = ['windows-update', 'windows-store', 'apt', 'pip']
-                    else:
-                        names = ['apt', 'pip']
-                case _:
-                    names = ['pip']
-        case _:
-            names = ['pip']
+    extra = [n for n in config_names(config, 'extra') if n not in names]
+    if 'default' in config:
+        # The list was spelled out, so leave its order alone.
+        names += extra
+    else:
+        # A known name goes where ORDER says; the sort is stable, so the
+        # rest stay behind in the order they came.
+        names = sorted(
+            names + extra,
+            key=lambda n: ORDER.index(n) if n in ORDER else len(ORDER),
+        )
 
-    if PyenvUpdater.has_pyenv():
-        names.append('pyenv')
-        # After pyenv, so a virtualenv whose base was just upgraded is already
-        # dealt with and only genuine stragglers are left to report.
-        if VenvUpdater.has_virtualenv():
-            names.append('venv')
-    if RustupUpdater.has_rustup():
-        names.append('rustup')
-    # After rustup, so anything rebuilt from source uses the toolchain that
-    # was just updated. Only worth queueing if cargo-update can do the check.
-    if CargoUpdater.has_cargo_update():
-        names.append('cargo')
-
-    return names
+    excluded = set(config_names(config, 'exclude'))
+    return [name for name in names if name not in excluded]
 
 
-def build_registry(args) -> dict[str, Callable[[], Updater]]:
-    """Build the name -> zero-arg Updater builder registry."""
-
-    return {
-        'brew': BrewUpdater,
-        'apt': AptUpdater,
-        'emerge': EmergeUpdater,
-        'macos': MacOsUpdater,
-        'mas': MasUpdater,
-        'windows-update': WindowsUpdateUpdater,
-        'windows-store': WindowsStoreUpdater,
-        'rustup': RustupUpdater,
-        'cargo': CargoUpdater,
-        'pyenv': PyenvUpdater,
-        'venv': VenvUpdater,
-        'pip': lambda: PipUpdater(args.pip_bin),
-    }
-
-
-def main():
-    args = parse_args()
+def main(argv: Sequence[str] | None = None):
+    args = parse_args(argv)
     configure_logging(args)
+    SETTINGS.yes = args.yes
+    SETTINGS.dry_run = args.dry_run
 
-    registry = build_registry(args)
+    try:
+        config = load_config(args.config)
+    except ConfigError as ex:
+        print(f'Bad config: {ex}', file=sys.stderr)
+        return 2
+    register_config_updaters(config)
+    load_plugins()
+
+    excluded = set(known_names(args.exclude, '--exclude'))
 
     if args.list:
-        defaults = set(default_updaters())
-        for updater_name in registry:
+        defaults = set(default_updaters(config)) - excluded
+        for updater_name in list_names():
             marker = '*' if updater_name in defaults else ' '
             print(f'{marker} {updater_name}')
         print('\n* runs by default on this platform')
         return 0
 
     if args.updaters:
-        unknown = [n for n in args.updaters if n not in registry]
+        unknown = [n for n in args.updaters if n not in REGISTRY]
         if unknown:
             print(
                 f'Unknown updater(s): {", ".join(unknown)}',
                 file=sys.stderr,
             )
             print(
-                f'Valid updaters: {", ".join(registry)}',
+                f'Valid updaters: {", ".join(list_names())}',
                 file=sys.stderr,
             )
             return 2
         selected = args.updaters
     else:
-        selected = default_updaters()
+        selected = default_updaters(config)
+    selected = [name for name in selected if name not in excluded]
 
     # A failing updater should not cost the user every updater queued behind
     # it; report at the end and exit non-zero instead.
     failures: list[tuple[str, int]] = []
     for updater_name in selected:
+        section = config.get(updater_name)
         try:
-            registry[updater_name]().run(skip_update=args.skip_update)
+            REGISTRY[updater_name].from_args(
+                args, section if isinstance(section, dict) else {}
+            ).run(skip_update=args.skip_update)
         except subprocess.CalledProcessError as ex:
             print(f'{updater_name}: {ex}', file=sys.stderr)
             failures.append((updater_name, ex.returncode or 1))
+        except UpdaterError as ex:
+            print(f'{updater_name}: {ex}', file=sys.stderr)
+            failures.append((updater_name, 1))
         except OSError as ex:
             print(f'{updater_name}: {ex}', file=sys.stderr)
             failures.append((updater_name, 1))
 
     if failures:
         print(
-            'Failed updaters: '
-            + ', '.join(name for name, _ in failures),
+            'Failed updaters: ' + ', '.join(name for name, _ in failures),
             file=sys.stderr,
         )
         return failures[0][1]
