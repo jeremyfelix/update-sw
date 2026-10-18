@@ -1,4 +1,4 @@
-# Configuration for update-sw (home/bin/update-sw).
+# Configuration for update-sw (bin/update-sw).
 #
 # Everything here is commented out, so this file changes nothing as shipped.
 # Uncomment what you want.  Run `update-sw --list` to see the updater names;

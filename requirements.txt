@@ -1,0 +1,3 @@
+tabulate
+# Optional, Linux only: lets update-sw detect the distribution.
+distro

@@ -13,7 +13,7 @@ Configuration
 
 An optional TOML file, ${XDG_CONFIG_HOME:-~/.config}/update-sw/config.toml
 (or the file given with --config), adjusts what runs.  Every key is
-optional.  See the example file in the dotfiles repo for commentary.
+optional.  See examples/config.toml in this repo for commentary.
 
     # Replace the computed default list entirely (kept in the order given)
     default = ['brew', 'pip']

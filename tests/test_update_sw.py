@@ -1,4 +1,4 @@
-"""Tests for home/bin/update-sw.  Nothing here runs a real subprocess."""
+"""Tests for bin/update-sw.  Nothing here runs a real subprocess."""
 
 import importlib.machinery
 import importlib.util
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parent.parent / 'home' / 'bin' / 'update-sw'
+SCRIPT = Path(__file__).resolve().parent.parent / 'bin' / 'update-sw'
 
 
 def load_script():
@@ -27,8 +27,8 @@ def load_script():
     module = importlib.util.module_from_spec(spec)
     # Registered before exec so plugins can `from update_sw import ...`.
     sys.modules['update_sw'] = module
-    # Loading from home/bin would otherwise leave a __pycache__ there,
-    # which gets deployed to ~/bin along with the script.
+    # Loading from bin/ would otherwise leave a __pycache__ there,
+    # next to the script.
     sys.dont_write_bytecode = True
     loader.exec_module(module)
     return module
@@ -675,7 +675,7 @@ def test_load_config_bad_toml(tmp_path):
 
 
 def test_example_config_is_a_no_op():
-    example = SCRIPT.parent.parent / '.config' / 'update-sw' / 'config.toml'
+    example = SCRIPT.parent.parent / 'examples' / 'config.toml'
     assert us.load_config(example) == {}
 
 
