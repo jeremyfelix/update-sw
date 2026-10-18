@@ -41,3 +41,7 @@ loaded as a plugin that can define more updaters. The module docstring of
 
     pip install pytest tabulate
     pytest
+
+## License
+
+BSD 2-Clause; see `LICENSE`.
