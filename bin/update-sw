@@ -220,6 +220,10 @@ class UpdaterError(Exception):
         self.failed = list(failed)
 
 
+class Restart(Exception):
+    """The script was replaced; re-run it so the rest uses the new code."""
+
+
 def run_each(
     items: Iterable[T],
     fn: Callable[[T], object],
@@ -296,6 +300,9 @@ REGISTRY: dict[str, type['Updater']] = {}
 # The order updaters run in, wherever they apply.  Updaters that are not
 # listed (from config or plugins) run after these, in registration order.
 ORDER: list[str] = [
+    # First, so that everything after it runs the new code: a restart re-runs
+    # whatever ran before it.
+    'self',
     'windows-update',
     'windows-store',
     'macos',
@@ -567,6 +574,66 @@ class CommandBasedUpdater(Updater):
 
     def _cleanup(self):
         self._run(self.cleanup_cmd)
+
+
+class SelfUpdater(CommandBasedUpdater):
+    """Fast-forwards the git clone this script runs from, then restarts.
+
+    Only git installs are supported.  The clone must have an upstream branch
+    (so a detached HEAD, as in a submodule checkout, does not qualify).  The
+    merge is --ff-only, so local changes or commits make it fail instead of
+    being overwritten.
+    """
+
+    name = 'self'
+
+    @staticmethod
+    def repo_dir() -> Path:
+        # Resolved so that a symlink from ~/bin leads back into the clone.
+        return Path(__file__).resolve().parent.parent
+
+    def __init__(self):
+        repo = str(self.repo_dir())
+        self.update_cmd = ('git', '-C', repo, 'fetch', '--quiet')
+        self.outdated_cmd = (
+            'git',
+            '-C',
+            repo,
+            'log',
+            '--oneline',
+            'HEAD..@{u}',
+        )
+        self.upgrade_cmd = ('git', '-C', repo, 'merge', '--ff-only', '@{u}')
+
+    @classmethod
+    def available(cls) -> bool:
+        return command_succeeds(
+            'git',
+            '-C',
+            str(cls.repo_dir()),
+            'rev-parse',
+            '--abbrev-ref',
+            '@{u}',
+        )
+
+    @classmethod
+    def missing_hint(cls) -> str | None:
+        if cls.available():
+            return None
+        return (
+            'update-sw is not running from a git clone with an upstream '
+            'branch, so it cannot update itself.'
+        )
+
+    def has_updates(self, output: str) -> bool:
+        return output.strip() != ''
+
+    def _upgrade(self):
+        super()._upgrade()
+        if not SETTINGS.dry_run:
+            # main() re-executes the script; the rest of this run would
+            # otherwise use code that has just been replaced.
+            raise Restart()
 
 
 class BrewUpdater(CommandBasedUpdater):
@@ -1559,8 +1626,11 @@ def default_updaters(config: dict[str, Any] | None = None) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None):
-    args = parse_args(argv)
+    args_list = list(argv if argv is not None else sys.argv[1:])
+    args = parse_args(args_list)
     configure_logging(args)
+    # Popped so that it reaches neither child processes nor a later run.
+    restarted = os.environ.pop('UPDATE_SW_RESTARTED', None) is not None
     SETTINGS.yes = args.yes
     SETTINGS.dry_run = args.dry_run
 
@@ -1598,6 +1668,13 @@ def main(argv: Sequence[str] | None = None):
     else:
         selected = default_updaters(config)
     selected = [name for name in selected if name not in excluded]
+    if restarted:
+        # Already updated, and this is the new code.
+        selected = [name for name in selected if name != 'self']
+    elif 'self' in selected:
+        # Config `default` can reorder, but a restart re-runs whatever ran
+        # before self, so it has to go first.
+        selected = ['self'] + [name for name in selected if name != 'self']
 
     # A failing updater should not cost the user every updater queued behind
     # it; report at the end and exit non-zero instead.
@@ -1608,6 +1685,13 @@ def main(argv: Sequence[str] | None = None):
             REGISTRY[updater_name].from_args(
                 args, section if isinstance(section, dict) else {}
             ).run(skip_update=args.skip_update)
+        except Restart:
+            print('Restarting update-sw on the new version...', flush=True)
+            os.execve(
+                sys.executable,
+                [sys.executable, str(Path(__file__).resolve()), *args_list],
+                {**os.environ, 'UPDATE_SW_RESTARTED': '1'},
+            )
         except subprocess.CalledProcessError as ex:
             print(f'{updater_name}: {ex}', file=sys.stderr)
             failures.append((updater_name, ex.returncode or 1))

@@ -37,6 +37,20 @@ Every `*.py` file in `${XDG_CONFIG_HOME:-~/.config}/update-sw/updaters/` is
 loaded as a plugin that can define more updaters. The module docstring of
 `bin/update-sw` describes the plugin interface with an example.
 
+## Updating update-sw itself
+
+When update-sw runs from a git clone that has an upstream branch, the `self`
+updater runs first. It fetches, shows the new commits and (after the usual
+prompt) fast-forwards the clone, which also updates `update-python` and
+`update-venv`. update-sw then restarts on the new code with the same
+arguments, so the rest of the run uses it.
+
+The merge is `--ff-only`, so local changes or commits make it fail rather than
+being overwritten. Turn it off with `-x self` or `exclude = ['self']` in the
+config. Only git installs are supported, and a checkout with a detached HEAD,
+such as a git submodule, has no upstream; use a standalone clone and symlink
+its `bin/` scripts onto your `PATH` instead.
+
 ## Tests
 
     pip install pytest tabulate
