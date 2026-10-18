@@ -926,7 +926,14 @@ def test_self_commands_use_repo_dir():
     repo = str(us.SelfUpdater.repo_dir())
     assert repo == str(SCRIPT.parent.parent)
     updater = us.SelfUpdater()
-    assert updater.update_cmd == ('git', '-C', repo, 'fetch', '--quiet')
+    assert updater.update_cmd == (
+        'git',
+        '-C',
+        repo,
+        'fetch',
+        '--quiet',
+        '--tags',
+    )
     assert updater.outdated_cmd == (
         'git',
         '-C',
@@ -1061,3 +1068,118 @@ def test_self_is_first_in_list(xdg, capsys):
     assert us.list_names()[0] == 'self'
     assert us.main(['--list']) == 0
     assert capsys.readouterr().out.splitlines()[0][2:] == 'self'
+
+
+# Versions
+
+
+@pytest.fixture
+def git_run(monkeypatch):
+    """Replace subprocess.run with one that returns `out` or raises `exc`."""
+
+    state = types.SimpleNamespace(calls=[], out='', exc=None)
+
+    def fake(args, **kwargs):
+        state.calls.append(args)
+        if state.exc is not None:
+            raise state.exc
+        return subprocess.CompletedProcess(args, 0, stdout=state.out)
+
+    us.version.cache_clear()
+    monkeypatch.setattr(subprocess, 'run', fake)
+    yield state
+    us.version.cache_clear()
+
+
+def test_version_is_git_describe(git_run):
+    git_run.out = 'v1.0.0-3-g22b5d76\n'
+    assert us.version() == 'v1.0.0-3-g22b5d76'
+    assert git_run.calls == [
+        [
+            'git',
+            '-C',
+            str(us.SelfUpdater.repo_dir()),
+            'describe',
+            '--tags',
+            '--always',
+            '--dirty',
+        ]
+    ]
+    # Cached.
+    us.version()
+    assert len(git_run.calls) == 1
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [FileNotFoundError('git'), subprocess.CalledProcessError(128, 'git')],
+)
+def test_version_unknown_when_git_fails(git_run, exc):
+    git_run.exc = exc
+    assert us.version() == 'unknown'
+
+
+def test_version_flag_prints_and_exits(git_run, capsys):
+    git_run.out = 'v1.2.3\n'
+    for flag in ('-V', '--version'):
+        us.version.cache_clear()
+        with pytest.raises(SystemExit) as ex:
+            us.parse_args([flag])
+        assert ex.value.code == 0
+        assert capsys.readouterr().out == 'update-sw v1.2.3\n'
+
+
+def test_git_not_run_without_version_flag(git_run, capsys):
+    us.parse_args(['-y', 'pip'])
+    us.create_parser()
+    assert git_run.calls == []
+
+
+def test_self_outdated_prints_old_and_new_version(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', 'abc123 Fix\n'),
+    )
+    described = []
+
+    def fake(*args):
+        described.append(args)
+        return 'v1.1.0' if args else 'v1.0.0'
+
+    monkeypatch.setattr(us, 'describe', fake)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == 'v1.0.0 -> v1.1.0\n'
+    assert described == [(), ('@{u}',)]
+
+
+def test_self_outdated_prints_no_versions_without_updates(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', ''),
+    )
+
+    def fail(*args):
+        raise AssertionError('should not describe')
+
+    monkeypatch.setattr(us, 'describe', fail)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == ''
+
+
+def test_self_outdated_skips_line_when_describe_fails(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', 'abc123 Fix\n'),
+    )
+
+    def fail(*args):
+        raise subprocess.CalledProcessError(128, 'git')
+
+    monkeypatch.setattr(us, 'describe', fail)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == ''

@@ -14,9 +14,35 @@
 
 set -uo pipefail
 
+# The directory this script lives in, following symlinks so that one in ~/bin
+# leads back to the clone. Plain `readlink` (no -f) is all macOS has, and a
+# relative link target is relative to the link's own directory.
+script_dir() {
+    local src=${BASH_SOURCE[0]} dir target
+    while [ -L "$src" ]; do
+        dir=$(cd -P "$(dirname "$src")" && pwd) || return 1
+        target=$(readlink "$src") || return 1
+        case $target in
+            /*) src=$target ;;
+            *) src=$dir/$target ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+# The version from git tags, e.g. v1.0.0-3-g22b5d76, or "unknown".
+version() {
+    local dir v
+    dir=$(script_dir) &&
+        v=$(git -C "$dir" describe --tags --always --dirty 2>/dev/null) &&
+        [ -n "$v" ] || v=unknown
+    echo "$v"
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: update-venv [--to VERSION] [--all] [--list] [NAME...]
+       update-venv -V|--version
 
 Moves pyenv virtualenvs onto a newer base Python, keeping their packages.
 
@@ -49,6 +75,7 @@ while [ $# -gt 0 ]; do
         --all) ALL=1; shift ;;
         --list) LIST=1; shift ;;
         -h|--help) usage; exit 0 ;;
+        -V|--version) echo "update-venv $(version)"; exit 0 ;;
         -*)
             echo "error: unknown option: $1" >&2
             usage

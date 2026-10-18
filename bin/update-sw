@@ -98,6 +98,21 @@ from tabulate import tabulate
 T = TypeVar('T')
 
 
+class VersionAction(argparse.Action):
+    """Print the version and exit.
+
+    Unlike action='version', the version is looked up only when the flag is
+    given, so building the parser does not run git on every invocation.
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f'update-sw {version()}')
+        parser.exit()
+
+
 def create_parser():
     """Create command line parser."""
 
@@ -161,6 +176,12 @@ def create_parser():
         '--verbose',
         action='count',
         help='verbose output, repeat for increased verbosity',
+    )
+    parser.add_argument(
+        '-V',
+        '--version',
+        action=VersionAction,
+        help='show the version (from git tags) and exit',
     )
     return parser
 
@@ -292,6 +313,38 @@ def command_succeeds(*args: str) -> bool:
         return True
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
+
+
+def describe(*args: str) -> str:
+    """`git describe --tags --always` in the clone this script runs from.
+
+    Raises FileNotFoundError (no git) or CalledProcessError (not a clone).
+    """
+
+    return subprocess.run(
+        [
+            'git',
+            '-C',
+            str(SelfUpdater.repo_dir()),
+            'describe',
+            '--tags',
+            '--always',
+            *args,
+        ],
+        capture_output=True,
+        check=True,
+        encoding='utf8',
+    ).stdout.strip()
+
+
+@cache
+def version() -> str:
+    """The version from git tags, e.g. v1.0.0-3-g22b5d76, or 'unknown'."""
+
+    try:
+        return describe('--dirty')
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return 'unknown'
 
 
 # name -> class for every concrete Updater, filled in as classes are defined.
@@ -594,7 +647,7 @@ class SelfUpdater(CommandBasedUpdater):
 
     def __init__(self):
         repo = str(self.repo_dir())
-        self.update_cmd = ('git', '-C', repo, 'fetch', '--quiet')
+        self.update_cmd = ('git', '-C', repo, 'fetch', '--quiet', '--tags')
         self.outdated_cmd = (
             'git',
             '-C',
@@ -604,6 +657,15 @@ class SelfUpdater(CommandBasedUpdater):
             'HEAD..@{u}',
         )
         self.upgrade_cmd = ('git', '-C', repo, 'merge', '--ff-only', '@{u}')
+
+    def _outdated(self):
+        super()._outdated()
+        if not self.has_updates(self.outdated_output):
+            return
+        try:
+            print(f'{describe()} -> {describe("@{u}")}')
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            pass
 
     @classmethod
     def available(cls) -> bool:
