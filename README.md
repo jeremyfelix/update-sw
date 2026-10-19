@@ -50,8 +50,19 @@ arguments, so the rest of the run uses it.
 
 `self` fetches from the clone's own remote, so clone over https to avoid SSH
 key prompts (for example from a hardware-backed or Secretive key) on every
-run. If the clone already uses SSH and you push from it, fetch over https and
-keep pushing over SSH with:
+run. The repository is public, so fetching needs no credentials at all.
+
+If a clone already uses SSH, this global git config makes every fetch of
+update-sw go over https while pushes keep using SSH. It needs no change to
+the clone and touches no other repository:
+
+    git config --global url.https://github.com/jeremyfelix/update-sw.insteadOf \
+        git@github.com:jeremyfelix/update-sw
+    git config --global url.git@github.com:jeremyfelix/update-sw.pushInsteadOf \
+        git@github.com:jeremyfelix/update-sw
+
+The second line rewrites push URLs to themselves; without it `insteadOf`
+would send pushes over https too. To change just one clone instead:
 
     git remote set-url origin https://github.com/jeremyfelix/update-sw
     git remote set-url --push origin git@github.com:jeremyfelix/update-sw.git
