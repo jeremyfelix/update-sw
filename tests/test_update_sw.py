@@ -244,6 +244,24 @@ def test_has_updates_macos():
     assert us.MacOsUpdater().has_updates(quiet + '* Label: macOS 15.1\n')
 
 
+def test_has_updates_macos_empty_output():
+    assert not us.MacOsUpdater().has_updates('')
+
+
+def test_has_updates_macos_label_style():
+    output = (
+        'Software Update Tool\n\n'
+        '* Label: macOS Sequoia 15.1-24B83\n'
+        '\tTitle: macOS Sequoia 15.1, Version: 15.1, Size: 1KiB\n'
+    )
+    assert us.MacOsUpdater().has_updates(output)
+
+
+def test_has_updates_macos_old_style():
+    output = 'Software Update Tool\n\n   * macOS-10.14.6\n\tmacOS, 1K\n'
+    assert us.MacOsUpdater().has_updates(output)
+
+
 def test_has_updates_rustup():
     updater = us.RustupUpdater()
     assert updater.has_updates('stable - Update available : 1.80 -> 1.81')
@@ -1183,3 +1201,47 @@ def test_self_outdated_skips_line_when_describe_fails(monkeypatch, capsys):
     monkeypatch.setattr(us, 'describe', fail)
     us.SelfUpdater()._outdated()
     assert capsys.readouterr().out == ''
+
+
+def test_outdated_says_up_to_date_without_updates(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_run_with_output',
+        staticmethod(lambda args, allowed_returncodes=(): ''),
+    )
+
+    class Check(us.CommandBasedUpdater):
+        name = 'check'
+        outdated_cmd = ('check',)
+
+        def has_updates(self, output):
+            return output != ''
+
+    Check()._outdated()
+    assert capsys.readouterr().out == 'Up to date.\n'
+
+
+def test_outdated_does_not_say_up_to_date_with_updates(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_run_with_output',
+        staticmethod(lambda args, allowed_returncodes=(): 'foo\n'),
+    )
+
+    class Check2(us.CommandBasedUpdater):
+        name = 'check2'
+        outdated_cmd = ('check2',)
+
+    Check2()._outdated()
+    assert capsys.readouterr().out == ''
+
+
+def test_self_outdated_says_version_is_up_to_date(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_run_with_output',
+        staticmethod(lambda args, allowed_returncodes=(): ''),
+    )
+    monkeypatch.setattr(us, 'version', lambda: 'v1.0.0')
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == 'update-sw v1.0.0 is up to date.\n'

@@ -19,7 +19,10 @@ Run any of them with `--help` for the options.
 
 ## Install
 
-Put `bin/` on your `PATH`, and install the dependencies:
+Clone the repository, put `bin/` on your `PATH`, and install the
+dependencies:
+
+    git clone https://github.com/jeremyfelix/update-sw
 
     pip install tabulate
     pip install distro    # optional, Linux only
@@ -44,6 +47,25 @@ updater runs first. It fetches, shows the new commits and (after the usual
 prompt) fast-forwards the clone, which also updates `update-python` and
 `update-venv`. update-sw then restarts on the new code with the same
 arguments, so the rest of the run uses it.
+
+`self` fetches from the clone's own remote, so clone over https to avoid SSH
+key prompts (for example from a hardware-backed or Secretive key) on every
+run. The repository is public, so fetching needs no credentials at all.
+
+If a clone already uses SSH, this global git config makes every fetch of
+update-sw go over https while pushes keep using SSH. It needs no change to
+the clone and touches no other repository:
+
+    git config --global url.https://github.com/jeremyfelix/update-sw.insteadOf \
+        git@github.com:jeremyfelix/update-sw
+    git config --global url.git@github.com:jeremyfelix/update-sw.pushInsteadOf \
+        git@github.com:jeremyfelix/update-sw
+
+The second line rewrites push URLs to themselves; without it `insteadOf`
+would send pushes over https too. To change just one clone instead:
+
+    git remote set-url origin https://github.com/jeremyfelix/update-sw
+    git remote set-url --push origin git@github.com:jeremyfelix/update-sw.git
 
 The merge is `--ff-only`, so local changes or commits make it fail rather than
 being overwritten. Turn it off with `-x self` or `exclude = ['self']` in the
