@@ -68,7 +68,7 @@ def set_platform(
     monkeypatch.setattr(us, 'is_wsl', lambda: wsl)
     # Only the updaters whose tools may be missing; the rest are available
     # wherever they apply.
-    for name in ('mas', 'pyenv', 'venv', 'rustup', 'cargo'):
+    for name in ('self', 'mas', 'pyenv', 'venv', 'rustup', 'cargo'):
         monkeypatch.setattr(
             us.REGISTRY[name],
             'available',
@@ -124,6 +124,7 @@ def test_latest_per_series_and_newest_series():
 
 def test_registry_contents():
     assert set(BUILTINS) == {
+        'self',
         'windows-update',
         'windows-store',
         'macos',
@@ -916,3 +917,269 @@ def test_parser_flags():
     assert args.yes and args.dry_run
     assert args.exclude == ['a', 'b']
     assert args.config == Path('f')
+
+
+# Self update
+
+
+def test_self_commands_use_repo_dir():
+    repo = str(us.SelfUpdater.repo_dir())
+    assert repo == str(SCRIPT.parent.parent)
+    updater = us.SelfUpdater()
+    assert updater.update_cmd == (
+        'git',
+        '-C',
+        repo,
+        'fetch',
+        '--quiet',
+        '--tags',
+    )
+    assert updater.outdated_cmd == (
+        'git',
+        '-C',
+        repo,
+        'log',
+        '--oneline',
+        'HEAD..@{u}',
+    )
+    assert updater.upgrade_cmd == (
+        'git',
+        '-C',
+        repo,
+        'merge',
+        '--ff-only',
+        '@{u}',
+    )
+
+
+def test_has_updates_self():
+    assert us.SelfUpdater().has_updates('abc123 Fix a thing\n')
+    assert not us.SelfUpdater().has_updates('')
+    assert not us.SelfUpdater().has_updates('\n')
+
+
+def test_self_availability_and_hint(monkeypatch):
+    seen = []
+
+    def fake(*args):
+        seen.append(args)
+        return False
+
+    monkeypatch.setattr(us, 'command_succeeds', fake)
+    assert not us.SelfUpdater.available()
+    assert seen == [
+        (
+            'git',
+            '-C',
+            str(us.SelfUpdater.repo_dir()),
+            'rev-parse',
+            '--abbrev-ref',
+            '@{u}',
+        )
+    ]
+    assert 'not running from a git clone' in us.SelfUpdater.missing_hint()
+
+    monkeypatch.setattr(us, 'command_succeeds', lambda *args: True)
+    assert us.SelfUpdater.available()
+    assert us.SelfUpdater.missing_hint() is None
+
+
+def test_self_upgrade_restarts(monkeypatch):
+    ran = []
+    monkeypatch.setattr(subprocess, 'run', lambda args, **k: ran.append(args))
+    updater = us.SelfUpdater()
+    with pytest.raises(us.Restart):
+        updater._upgrade()
+    assert ran == [updater.upgrade_cmd]
+
+
+def test_self_upgrade_dry_run_does_not_restart(no_subprocess, capsys):
+    us.SETTINGS.dry_run = True
+    updater = us.SelfUpdater()
+    updater._upgrade()
+    assert 'would run: git -C ' in capsys.readouterr().out
+
+
+def test_self_failed_merge_is_reported_by_main(monkeypatch, capsys):
+    def fail(self, skip_update=False):
+        raise subprocess.CalledProcessError(128, 'git')
+
+    monkeypatch.setattr(us.SelfUpdater, 'run', fail)
+    assert us.main(['self']) == 128
+    assert 'Failed updaters: self' in capsys.readouterr().err
+
+
+def test_main_restarts_on_restart(monkeypatch, capsys):
+    def restart(self, skip_update=False):
+        raise us.Restart()
+
+    calls = []
+
+    def fake_execve(path, argv, env):
+        calls.append((path, argv, env))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(us.SelfUpdater, 'run', restart)
+    monkeypatch.setattr(us.os, 'execve', fake_execve)
+    monkeypatch.delenv('UPDATE_SW_RESTARTED', raising=False)
+    with pytest.raises(SystemExit):
+        us.main(['-y', 'self', '-x', 'pip'])
+    assert 'Restarting update-sw' in capsys.readouterr().out
+    [(path, argv, env)] = calls
+    assert path == sys.executable
+    assert argv == [sys.executable, str(SCRIPT), '-y', 'self', '-x', 'pip']
+    assert env['UPDATE_SW_RESTARTED'] == '1'
+    # The variable is only for the child.
+    assert 'UPDATE_SW_RESTARTED' not in us.os.environ
+
+
+def test_main_after_restart_skips_self(monkeypatch):
+    ran = []
+    monkeypatch.setattr(
+        us.Updater,
+        'run',
+        lambda self, skip_update=False: ran.append(self.name),
+    )
+    monkeypatch.setenv('UPDATE_SW_RESTARTED', '1')
+    assert us.main(['self', 'pip']) == 0
+    assert ran == ['pip']
+    assert 'UPDATE_SW_RESTARTED' not in us.os.environ
+
+
+def test_main_moves_self_first(xdg, monkeypatch):
+    set_platform(monkeypatch, available=['self'])
+    (xdg / 'config.toml').write_text('default = ["pip", "self"]\n')
+    ran = []
+    monkeypatch.setattr(
+        us.Updater,
+        'run',
+        lambda self, skip_update=False: ran.append(self.name),
+    )
+    monkeypatch.delenv('UPDATE_SW_RESTARTED', raising=False)
+    assert us.main([]) == 0
+    assert ran == ['self', 'pip']
+    ran.clear()
+    assert us.main(['pip', 'self']) == 0
+    assert ran == ['self', 'pip']
+
+
+def test_self_is_first_in_list(xdg, capsys):
+    assert us.ORDER[0] == 'self'
+    assert us.list_names()[0] == 'self'
+    assert us.main(['--list']) == 0
+    assert capsys.readouterr().out.splitlines()[0][2:] == 'self'
+
+
+# Versions
+
+
+@pytest.fixture
+def git_run(monkeypatch):
+    """Replace subprocess.run with one that returns `out` or raises `exc`."""
+
+    state = types.SimpleNamespace(calls=[], out='', exc=None)
+
+    def fake(args, **kwargs):
+        state.calls.append(args)
+        if state.exc is not None:
+            raise state.exc
+        return subprocess.CompletedProcess(args, 0, stdout=state.out)
+
+    us.version.cache_clear()
+    monkeypatch.setattr(subprocess, 'run', fake)
+    yield state
+    us.version.cache_clear()
+
+
+def test_version_is_git_describe(git_run):
+    git_run.out = 'v1.0.0-3-g22b5d76\n'
+    assert us.version() == 'v1.0.0-3-g22b5d76'
+    assert git_run.calls == [
+        [
+            'git',
+            '-C',
+            str(us.SelfUpdater.repo_dir()),
+            'describe',
+            '--tags',
+            '--always',
+            '--dirty',
+        ]
+    ]
+    # Cached.
+    us.version()
+    assert len(git_run.calls) == 1
+
+
+@pytest.mark.parametrize(
+    'exc',
+    [FileNotFoundError('git'), subprocess.CalledProcessError(128, 'git')],
+)
+def test_version_unknown_when_git_fails(git_run, exc):
+    git_run.exc = exc
+    assert us.version() == 'unknown'
+
+
+def test_version_flag_prints_and_exits(git_run, capsys):
+    git_run.out = 'v1.2.3\n'
+    for flag in ('-V', '--version'):
+        us.version.cache_clear()
+        with pytest.raises(SystemExit) as ex:
+            us.parse_args([flag])
+        assert ex.value.code == 0
+        assert capsys.readouterr().out == 'update-sw v1.2.3\n'
+
+
+def test_git_not_run_without_version_flag(git_run, capsys):
+    us.parse_args(['-y', 'pip'])
+    us.create_parser()
+    assert git_run.calls == []
+
+
+def test_self_outdated_prints_old_and_new_version(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', 'abc123 Fix\n'),
+    )
+    described = []
+
+    def fake(*args):
+        described.append(args)
+        return 'v1.1.0' if args else 'v1.0.0'
+
+    monkeypatch.setattr(us, 'describe', fake)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == 'v1.0.0 -> v1.1.0\n'
+    assert described == [(), ('@{u}',)]
+
+
+def test_self_outdated_prints_no_versions_without_updates(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', ''),
+    )
+
+    def fail(*args):
+        raise AssertionError('should not describe')
+
+    monkeypatch.setattr(us, 'describe', fail)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == ''
+
+
+def test_self_outdated_skips_line_when_describe_fails(monkeypatch, capsys):
+    monkeypatch.setattr(
+        us.CommandBasedUpdater,
+        '_outdated',
+        lambda self: setattr(self, 'outdated_output', 'abc123 Fix\n'),
+    )
+
+    def fail(*args):
+        raise subprocess.CalledProcessError(128, 'git')
+
+    monkeypatch.setattr(us, 'describe', fail)
+    us.SelfUpdater()._outdated()
+    assert capsys.readouterr().out == ''

@@ -11,10 +11,36 @@
 
 set -uo pipefail
 
+# The directory this script lives in, following symlinks so that one in ~/bin
+# leads back to the clone. Plain `readlink` (no -f) is all macOS has, and a
+# relative link target is relative to the link's own directory.
+script_dir() {
+    local src=${BASH_SOURCE[0]} dir target
+    while [ -L "$src" ]; do
+        dir=$(cd -P "$(dirname "$src")" && pwd) || return 1
+        target=$(readlink "$src") || return 1
+        case $target in
+            /*) src=$target ;;
+            *) src=$dir/$target ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+# The version from git tags, e.g. v1.0.0-3-g22b5d76, or "unknown".
+version() {
+    local dir v
+    dir=$(script_dir) &&
+        v=$(git -C "$dir" describe --tags --always --dirty 2>/dev/null) &&
+        [ -n "$v" ] || v=unknown
+    echo "$v"
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: update-python [--migrate-venvs] [--force|--rebuild] [--no-jit]
                      [--skip-deps-check] NEW_VERSION [OLD_VERSION]
+       update-python -V|--version
 
 Installs NEW_VERSION with pyenv and migrates OLD_VERSION's packages onto it.
 OLD_VERSION defaults to the first entry of `pyenv global`, except when
@@ -55,6 +81,7 @@ for arg in "$@"; do
         --no-jit) NO_JIT=1 ;;
         --skip-deps-check) SKIP_DEPS_CHECK=1 ;;
         -h|--help) usage; exit 0 ;;
+        -V|--version) echo "update-python $(version)"; exit 0 ;;
         -*)
             echo "error: unknown option: $arg" >&2
             usage

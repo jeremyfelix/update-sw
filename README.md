@@ -37,6 +37,33 @@ Every `*.py` file in `${XDG_CONFIG_HOME:-~/.config}/update-sw/updaters/` is
 loaded as a plugin that can define more updaters. The module docstring of
 `bin/update-sw` describes the plugin interface with an example.
 
+## Updating update-sw itself
+
+When update-sw runs from a git clone that has an upstream branch, the `self`
+updater runs first. It fetches, shows the new commits and (after the usual
+prompt) fast-forwards the clone, which also updates `update-python` and
+`update-venv`. update-sw then restarts on the new code with the same
+arguments, so the rest of the run uses it.
+
+The merge is `--ff-only`, so local changes or commits make it fail rather than
+being overwritten. Turn it off with `-x self` or `exclude = ['self']` in the
+config. Only git installs are supported, and a checkout with a detached HEAD,
+such as a git submodule, has no upstream; use a standalone clone and symlink
+its `bin/` scripts onto your `PATH` instead.
+
+## Versions
+
+Each script prints its version with `--version` (or `-V`), for example
+`update-sw v1.0.0-3-g22b5d76`. It comes from `git describe --tags --always
+--dirty` in the clone the script lives in (following symlinks), or is
+`unknown` outside a git clone. There is nothing to bump by hand. To release,
+tag the commit and push the tag:
+
+    git tag -a vX.Y.Z -m "Release vX.Y.Z" && git push --tags
+
+When `self` finds updates it shows the change as `v1.0.0 -> v1.1.0`, so
+releases are worth tagging.
+
 ## Tests
 
     pip install pytest tabulate

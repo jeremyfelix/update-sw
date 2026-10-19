@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history and tags, so `git describe` sees real versions.
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+
+  # macOS ships bash 3.2 as /bin/bash; the bash scripts must keep working on it.
+  bash32:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: /bin/bash --version | head -n 1
+      - run: /bin/bash -n bin/update-python && /bin/bash -n bin/update-venv
+      - name: --version, directly and through a symlink
+        run: |
+          ln -s "$PWD/bin/update-venv" "$RUNNER_TEMP/uv"
+          ln -s "$PWD/bin/update-python" "$RUNNER_TEMP/up"
+          for script in bin/update-venv bin/update-python "$RUNNER_TEMP/uv" "$RUNNER_TEMP/up"; do
+            out=$(/bin/bash "$script" --version)
+            echo "$out"
+            case $out in *' unknown'|'') exit 1 ;; esac
+          done
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # SC1007: `local a= b=` is used on purpose to declare empty locals.
+      - run: shellcheck -S warning -e SC1007 bin/update-python bin/update-venv
