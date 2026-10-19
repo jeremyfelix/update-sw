@@ -19,7 +19,10 @@ Run any of them with `--help` for the options.
 
 ## Install
 
-Put `bin/` on your `PATH`, and install the dependencies:
+Clone the repository, put `bin/` on your `PATH`, and install the
+dependencies:
+
+    git clone https://github.com/jeremyfelix/update-sw
 
     pip install tabulate
     pip install distro    # optional, Linux only
@@ -44,6 +47,14 @@ updater runs first. It fetches, shows the new commits and (after the usual
 prompt) fast-forwards the clone, which also updates `update-python` and
 `update-venv`. update-sw then restarts on the new code with the same
 arguments, so the rest of the run uses it.
+
+`self` fetches from the clone's own remote, so clone over https to avoid SSH
+key prompts (for example from a hardware-backed or Secretive key) on every
+run. If the clone already uses SSH and you push from it, fetch over https and
+keep pushing over SSH with:
+
+    git remote set-url origin https://github.com/jeremyfelix/update-sw
+    git remote set-url --push origin git@github.com:jeremyfelix/update-sw.git
 
 The merge is `--ff-only`, so local changes or commits make it fail rather than
 being overwritten. Turn it off with `-x self` or `exclude = ['self']` in the

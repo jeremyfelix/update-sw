@@ -469,6 +469,10 @@ class Updater:
         return f'Outdated ({self.name}):'
 
     @property
+    def up_to_date_message(self) -> str:
+        return 'Up to date.'
+
+    @property
     def upgrade_prompt(self) -> str:
         return f'Run upgrade ({self.name})? [Y/n]: '
 
@@ -621,6 +625,9 @@ class CommandBasedUpdater(Updater):
         self.outdated_output = self._run_with_output(
             self.outdated_cmd, self.outdated_ok_returncodes
         )
+        # Otherwise the banner is followed by nothing, which looks broken.
+        if not self.has_updates(self.outdated_output):
+            print(self.up_to_date_message)
 
     def _upgrade(self):
         self._run(self.upgrade_cmd)
@@ -639,6 +646,10 @@ class SelfUpdater(CommandBasedUpdater):
     """
 
     name = 'self'
+
+    @property
+    def up_to_date_message(self) -> str:
+        return f'update-sw {version()} is up to date.'
 
     @staticmethod
     def repo_dir() -> Path:
@@ -1305,7 +1316,12 @@ class MacOsUpdater(CommandBasedUpdater):
         return is_darwin()
 
     def has_updates(self, output: str) -> bool:
-        return not output.endswith('Finding available software\n')
+        # Modern softwareupdate writes "Finding available software" and "No
+        # new software available." to stderr, so stdout is empty when there
+        # is nothing.  Updates are listed as lines starting with `*`.
+        return any(
+            line.lstrip().startswith('*') for line in output.splitlines()
+        )
 
 
 class MasUpdater(CommandBasedUpdater):
